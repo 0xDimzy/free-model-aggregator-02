@@ -306,6 +306,24 @@ async function readBodyJson(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
+/** A client chat request, parsed and validated: the body plus the fields routing reads off it. */
+type ParsedChatRequest =
+  | { ok: true; body: Json; model: unknown; messages: unknown; stream: boolean }
+  | { ok: false; error: string };
+
+/**
+ * One client request as a chat request: read the body, parse its JSON, and pull out the model,
+ * the messages and the stream flag the routing reads. A body that is not one JSON object (or is
+ * too large) is not a chat request at all: the caller answers 400 with the error, exactly as
+ * before. The model and messages are carried as they arrived — no extra validation here, the
+ * translators read what they need off the body, so a request the old path served is still served.
+ */
+async function parseChatRequest(req: IncomingMessage): Promise<ParsedChatRequest> {
+  const body = await readBodyJson(req);
+  if (body === null) return { ok: false, error: 'the request body is not one JSON object' };
+  return { ok: true, body, model: body.model, messages: body.messages, stream: body.stream === true };
+}
+
 function sendJSON(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
@@ -335,16 +353,29 @@ interface UpstreamRequest {
   body: string;
 }
 
-/** One candidate's upstream request, in that provider's own wire. */
-function buildUpstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): UpstreamRequest {
-  const probe = candidate.probe;
-  const base = joinBase(ENV_URL, probe.provider.base);
+/**
+ * The headers for one upstream POST, in that provider's own wire: JSON content, the provider's
+ * auth (a bearer token, an x-api-key, or nothing when the provider carries no key), the SSE
+ * accept header when the client asked to stream, and the Anthropic version on that wire. The
+ * same headers for every wire and every client shape — the only thing that varies is the wire
+ * and the stream flag, so one helper builds them for all three branches below.
+ */
+function upstreamHeaders(probe: Probe, wire: 'openai' | 'anthropic' | 'gemini', stream: boolean): Record<string, string> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     ...authHeaders(probe.provider.auth, probe.provider.key),
   };
-  if (body.stream === true) headers.accept = 'text/event-stream';
+  if (stream) headers.accept = 'text/event-stream';
+  if (wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  return headers;
+}
+
+/** One candidate's upstream request, in that provider's own wire. */
+function buildUpstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): UpstreamRequest {
+  const probe = candidate.probe;
+  const base = joinBase(ENV_URL, probe.provider.base);
   const wire = probe.provider.wire;
+  const headers = upstreamHeaders(probe, wire, body.stream === true);
   if (wire === 'openai') {
     if (clientApi === 'openai') {
       const upstream: Json = { ...body, model: candidate.model.id };
@@ -356,7 +387,6 @@ function buildUpstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthr
     return { url: `${base}/v1/chat/completions`, headers, body: JSON.stringify(anthropicToOpenAI(body, candidate.model.id)) };
   }
   if (wire === 'anthropic') {
-    headers['anthropic-version'] = '2023-06-01';
     if (clientApi === 'anthropic') {
       return { url: `${base}/v1/messages`, headers, body: JSON.stringify({ ...body, model: candidate.model.id }) };
     }
@@ -521,13 +551,12 @@ function sendDelivery(res: ServerResponse, clientApi: 'openai' | 'anthropic', st
  * answer the walk produced.
  */
 async function serveRequest(clientApi: 'openai' | 'anthropic', req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readBodyJson(req);
-  if (body === null) return replyError(res, clientApi, 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const stream = body.stream === true;
+  const parsed = await parseChatRequest(req);
+  if (!parsed.ok) return replyError(res, clientApi, 400, 'invalid_request_error', parsed.error);
   const reqIndex = arrivalIndex;
-  const candidates = rankedCandidates(clientApi, body, requirementsNow(body), reqIndex);
-  const delivery = await deliverRequest(clientApi, body, candidates, stream);
-  sendDelivery(res, clientApi, stream, delivery);
+  const candidates = rankedCandidates(clientApi, parsed.body, requirementsNow(parsed.body), reqIndex);
+  const delivery = await deliverRequest(clientApi, parsed.body, candidates, parsed.stream);
+  sendDelivery(res, clientApi, parsed.stream, delivery);
 }
 
 async function routeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {

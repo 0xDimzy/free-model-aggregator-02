@@ -304,6 +304,22 @@ export function parseSseFrames(text: string): SseFrame[] {
   return frames;
 }
 
+/**
+ * One SSE frame's data as a JSON object, or null when it is not one: a frame whose data is not
+ * JSON, or is JSON but not an object, carries nothing a stream translator can use, so the caller
+ * skips it. Every stream translator below did this same parse-and-check inline — six sites with
+ * the same six lines — so they share the one helper and the skip reads the same at each site.
+ */
+export function recordOfFrame(frame: SseFrame): Json | null {
+  let event: unknown;
+  try {
+    event = JSON.parse(frame.data);
+  } catch {
+    return null;
+  }
+  return isRecord(event) ? event : null;
+}
+
 /** A buffered text as a readable stream, for the one translator that reads a live stream. */
 export function streamOfText(text: string): ReadableStream<Uint8Array> {
   const encoded = new TextEncoder().encode(text);
@@ -767,13 +783,8 @@ export async function* geminiStreamToOpenAI(upstream: ReadableStream<Uint8Array>
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
         for (const parsed of parseSseFrames(`${frame}\n\n`)) {
-          let event: unknown;
-          try {
-            event = JSON.parse(parsed.data);
-          } catch {
-            continue;
-          }
-          if (!isRecord(event)) continue;
+          const event = recordOfFrame(parsed);
+          if (event === null) continue;
           const answer = geminiTextOf(event);
           last = { inputTokens: answer.inputTokens, outputTokens: answer.outputTokens, finishReason: answer.finishReason };
           if (answer.text !== '') {
@@ -787,13 +798,8 @@ export async function* geminiStreamToOpenAI(upstream: ReadableStream<Uint8Array>
     buffer += decoder.decode();
     if (buffer.trim() !== '') {
       for (const parsed of parseSseFrames(buffer)) {
-        let event: unknown;
-        try {
-          event = JSON.parse(parsed.data);
-        } catch {
-          continue;
-        }
-        if (!isRecord(event)) continue;
+        const event = recordOfFrame(parsed);
+        if (event === null) continue;
         const answer = geminiTextOf(event);
         last = { inputTokens: answer.inputTokens, outputTokens: answer.outputTokens, finishReason: answer.finishReason };
         if (answer.text !== '') {
@@ -817,6 +823,31 @@ export async function* geminiStreamToOpenAI(upstream: ReadableStream<Uint8Array>
   yield 'data: [DONE]\n\n';
 }
 
+/**
+ * The two events that open a Gemini-to-Anthropic text stream: message_start (carrying the
+ * prompt tokens the answer reports) and the first text block's content_block_start. The main
+ * loop and the trailing-buffer tail both open the stream this way, so they share the one helper
+ * instead of repeating the same two yields.
+ */
+function openGeminiAnthropicStream(model: string, inputTokens: number): string[] {
+  return [
+    sseEvent('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_stream',
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: 0 },
+      },
+    }),
+    sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+  ];
+}
+
 /** A Gemini SSE stream as Anthropic events. */
 export async function* geminiStreamToAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -836,33 +867,15 @@ export async function* geminiStreamToAnthropic(upstream: ReadableStream<Uint8Arr
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
         for (const parsed of parseSseFrames(`${frame}\n\n`)) {
-          let event: unknown;
-          try {
-            event = JSON.parse(parsed.data);
-          } catch {
-            continue;
-          }
-          if (!isRecord(event)) continue;
+          const event = recordOfFrame(parsed);
+          if (event === null) continue;
           const answer = geminiTextOf(event);
           outputTokens = answer.outputTokens;
           heldStop = stopReasonToAnthropic(answer.finishReason);
           if (answer.text !== '') {
             if (!started) {
               started = true;
-              yield sseEvent('message_start', {
-                type: 'message_start',
-                message: {
-                  id: 'msg_stream',
-                  type: 'message',
-                  role: 'assistant',
-                  model,
-                  content: [],
-                  stop_reason: null,
-                  stop_sequence: null,
-                  usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
-                },
-              });
-              yield sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+              for (const event of openGeminiAnthropicStream(model, answer.inputTokens)) yield event;
             }
             yield sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } });
           }
@@ -873,33 +886,15 @@ export async function* geminiStreamToAnthropic(upstream: ReadableStream<Uint8Arr
     buffer += decoder.decode();
     if (buffer.trim() !== '') {
       for (const parsed of parseSseFrames(buffer)) {
-        let event: unknown;
-        try {
-          event = JSON.parse(parsed.data);
-        } catch {
-          continue;
-        }
-        if (!isRecord(event)) continue;
+        const event = recordOfFrame(parsed);
+        if (event === null) continue;
         const answer = geminiTextOf(event);
         outputTokens = answer.outputTokens;
         heldStop = stopReasonToAnthropic(answer.finishReason);
         if (answer.text !== '') {
           if (!started) {
             started = true;
-            yield sseEvent('message_start', {
-              type: 'message_start',
-              message: {
-                id: 'msg_stream',
-                type: 'message',
-                role: 'assistant',
-                model,
-                content: [],
-                stop_reason: null,
-                stop_sequence: null,
-                usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
-              },
-            });
-            yield sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+            for (const event of openGeminiAnthropicStream(model, answer.inputTokens)) yield event;
           }
           yield sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } });
         }
@@ -947,13 +942,8 @@ export async function* anthropicStreamToOpenAI(upstream: ReadableStream<Uint8Arr
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
         for (const parsed of parseSseFrames(`${frame}\n\n`)) {
-          let event: unknown;
-          try {
-            event = JSON.parse(parsed.data);
-          } catch {
-            continue;
-          }
-          if (!isRecord(event)) continue;
+          const event = recordOfFrame(parsed);
+          if (event === null) continue;
           if (event.type === 'message_start' && isRecord(event.message) && isRecord(event.message.usage)) {
             inputTokens = numberOrZero(event.message.usage.input_tokens);
           }
@@ -971,13 +961,8 @@ export async function* anthropicStreamToOpenAI(upstream: ReadableStream<Uint8Arr
     buffer += decoder.decode();
     if (buffer.trim() !== '') {
       for (const parsed of parseSseFrames(buffer)) {
-        let event: unknown;
-        try {
-          event = JSON.parse(parsed.data);
-        } catch {
-          continue;
-        }
-        if (!isRecord(event)) continue;
+        const event = recordOfFrame(parsed);
+        if (event === null) continue;
         if (event.type === 'message_start' && isRecord(event.message) && isRecord(event.message.usage)) {
           inputTokens = numberOrZero(event.message.usage.input_tokens);
         }
