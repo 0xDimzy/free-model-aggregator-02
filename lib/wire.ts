@@ -163,11 +163,11 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   const messages: Json[] = [];
   const system = textOf(body.system);
   if (system !== '') messages.push({ role: 'system', content: system });
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    const assistant = raw.role === 'assistant';
-    const content = raw.content;
+  const incoming = Array.isArray(body.messages) ? body.messages : [];
+  for (const msg of incoming) {
+    if (!isRecord(msg)) continue;
+    const assistant = msg.role === 'assistant';
+    const content = msg.content;
     if (typeof content === 'string') {
       messages.push({ role: assistant ? 'assistant' : 'user', content });
       continue;
@@ -187,11 +187,9 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
         });
       }
       const text = textOf(content);
-      messages.push({
-        role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-      });
+      const assistantMsg: Json = { role: 'assistant', content: text !== '' ? text : null };
+      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+      messages.push(assistantMsg);
       continue;
     }
     const parts: Json[] = [];
@@ -292,11 +290,12 @@ export interface SseFrame {
 export function parseSseFrames(text: string): SseFrame[] {
   const frames: SseFrame[] = [];
   const normalized = text.replace(/\r\n/g, '\n');
-  for (const frame of normalized.split('\n\n')) {
-    if (frame.trim() === '') continue;
+  const rawFrames = normalized.split('\n\n');
+  for (const raw of rawFrames) {
+    if (raw.trim() === '') continue;
     let event: string | null = null;
     const data: string[] = [];
-    for (const line of frame.split('\n')) {
+    for (const line of raw.split('\n')) {
       if (line.startsWith('event:')) event = line.slice('event:'.length).trim();
       else if (line.startsWith('data:')) data.push(line.slice('data:'.length).replace(/^ /, ''));
     }
@@ -328,14 +327,14 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   let started = false;
   let finished = false;
   /** The stop reason a finish_reason named, held until the stream's usage chunk has arrived. */
-  let pendingStop: string | null = null;
-  let textIndex = -1;
-  let nextIndex = 0;
-  const toolIndexes = new Map<number, number>();
+  let heldStop: string | null = null;
+  let textBlock = -1;
+  let nextBlock = 0;
+  const toolBlocks = new Map<number, number>();
   let inputTokens = 0;
   let outputTokens = 0;
 
-  const startEvents = (): string[] => {
+  const openEvents = (): string[] => {
     if (started) return [];
     started = true;
     return [
@@ -354,21 +353,21 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       }),
     ];
   };
-  const closeEvents = (): string[] => {
+  const closeBlocks = (): string[] => {
     const out: string[] = [];
-    if (textIndex !== -1) {
-      out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-      textIndex = -1;
+    if (textBlock !== -1) {
+      out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textBlock }));
+      textBlock = -1;
     }
-    for (const index of [...toolIndexes.values()].sort((a, b) => a - b)) out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
-    toolIndexes.clear();
+    for (const index of [...toolBlocks.values()].sort((a, b) => a - b)) out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
+    toolBlocks.clear();
     return out;
   };
-  const finishEvents = (stopReason: string): string[] => {
+  const finishWith = (stopReason: string): string[] => {
     if (finished) return [];
     finished = true;
     return [
-      ...closeEvents(),
+      ...closeBlocks(),
       sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }),
       sseEvent('message_stop', { type: 'message_stop' }),
     ];
@@ -382,7 +381,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       if (!trimmed.startsWith('data:')) continue;
       const payload = trimmed.slice(5).trim();
       if (payload === '[DONE]') {
-        out.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
+        out.push(...openEvents(), ...finishWith(heldStop ?? 'end_turn'));
         continue;
       }
       let chunk: unknown;
@@ -400,28 +399,28 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       const choice = isRecord(choices[0]) ? choices[0] : null;
       if (choice === null) continue;
       const delta = isRecord(choice.delta) ? choice.delta : {};
-      out.push(...startEvents());
+      out.push(...openEvents());
       if (typeof delta.content === 'string' && delta.content !== '') {
-        if (textIndex === -1) {
-          textIndex = nextIndex;
-          nextIndex += 1;
-          out.push(sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } }));
+        if (textBlock === -1) {
+          textBlock = nextBlock;
+          nextBlock += 1;
+          out.push(sseEvent('content_block_start', { type: 'content_block_start', index: textBlock, content_block: { type: 'text', text: '' } }));
         }
-        out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } }));
+        out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: textBlock, delta: { type: 'text_delta', text: delta.content } }));
       }
       const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
       for (const call of calls) {
         if (!isRecord(call)) continue;
-        const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
-        let index = toolIndexes.get(upstreamIndex);
+        const upstreamIndex = typeof call.index === 'number' ? call.index : toolBlocks.size;
+        let index = toolBlocks.get(upstreamIndex);
         if (index === undefined) {
-          if (textIndex !== -1) {
-            out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-            textIndex = -1;
+          if (textBlock !== -1) {
+            out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textBlock }));
+            textBlock = -1;
           }
-          index = nextIndex;
-          nextIndex += 1;
-          toolIndexes.set(upstreamIndex, index);
+          index = nextBlock;
+          nextBlock += 1;
+          toolBlocks.set(upstreamIndex, index);
           const fn = isRecord(call.function) ? call.function : {};
           out.push(
             sseEvent('content_block_start', {
@@ -443,7 +442,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       }
       // Hold the stop reason until the stream's last chunk (the usage one) and [DONE] have arrived: OpenAI
       // sends the usage after the finish_reason, and Anthropic's message_delta carries the output tokens.
-      if (choice.finish_reason !== null && choice.finish_reason !== undefined) pendingStop = stopReasonOf(choice.finish_reason);
+      if (choice.finish_reason !== null && choice.finish_reason !== undefined) heldStop = stopReasonOf(choice.finish_reason);
     }
     return out;
   };
@@ -467,8 +466,8 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     reader.releaseLock();
   }
   if (!finished) {
-    for (const event of startEvents()) yield event;
-    for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
+    for (const event of openEvents()) yield event;
+    for (const event of finishWith(heldStop ?? 'end_turn')) yield event;
   }
 }
 
@@ -575,17 +574,17 @@ function geminiGenerationConfig(maxTokens: number | undefined, stops: string[], 
 export function openAIToGemini(body: Json): Json {
   const systemParts: string[] = [];
   const contents: Json[] = [];
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    if (raw.role === 'system') {
-      const text = textOf(raw.content);
+  const incoming = Array.isArray(body.messages) ? body.messages : [];
+  for (const msg of incoming) {
+    if (!isRecord(msg)) continue;
+    if (msg.role === 'system') {
+      const text = textOf(msg.content);
       if (text !== '') systemParts.push(text);
       continue;
     }
-    if (raw.role === 'assistant') {
-      const parts = geminiPartsOfOpenAI(raw.content);
-      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+    if (msg.role === 'assistant') {
+      const parts = geminiPartsOfOpenAI(msg.content);
+      const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       for (const call of calls) {
         if (!isRecord(call) || !isRecord(call.function)) continue;
         parts.push({
@@ -598,15 +597,15 @@ export function openAIToGemini(body: Json): Json {
       if (parts.length > 0) contents.push({ role: 'model', parts });
       continue;
     }
-    if (raw.role === 'tool') {
-      const text = typeof raw.content === 'string' ? raw.content : textOf(raw.content);
+    if (msg.role === 'tool') {
+      const text = typeof msg.content === 'string' ? msg.content : textOf(msg.content);
       contents.push({
         role: 'user',
-        parts: [{ functionResponse: { name: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : 'tool', response: { output: text } } }],
+        parts: [{ functionResponse: { name: typeof msg.tool_call_id === 'string' ? msg.tool_call_id : 'tool', response: { output: text } } }],
       });
       continue;
     }
-    const parts = geminiPartsOfOpenAI(raw.content);
+    const parts = geminiPartsOfOpenAI(msg.content);
     if (parts.length > 0) contents.push({ role: 'user', parts });
   }
   const out: Json = { contents };
@@ -624,12 +623,12 @@ export function openAIToGemini(body: Json): Json {
  */
 export function anthropicToGemini(body: Json): Json {
   const contents: Json[] = [];
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    if (raw.role === 'assistant') {
+  const incoming = Array.isArray(body.messages) ? body.messages : [];
+  for (const msg of incoming) {
+    if (!isRecord(msg)) continue;
+    if (msg.role === 'assistant') {
       const parts: Json[] = [];
-      const content = raw.content;
+      const content = msg.content;
       if (typeof content === 'string') {
         if (content !== '') parts.push({ text: content });
       } else if (Array.isArray(content)) {
@@ -646,7 +645,7 @@ export function anthropicToGemini(body: Json): Json {
       if (parts.length > 0) contents.push({ role: 'model', parts });
       continue;
     }
-    const parts = geminiPartsOfAnthropic(raw.content);
+    const parts = geminiPartsOfAnthropic(msg.content);
     if (parts.length > 0) contents.push({ role: 'user', parts });
   }
   const out: Json = { contents };
@@ -727,6 +726,8 @@ export function anthropicToOpenAIResponse(body: Json, model: string): Json {
   const usage = isRecord(body.usage) ? body.usage : {};
   const input = numberOrZero(usage.input_tokens);
   const output = numberOrZero(usage.output_tokens);
+  const message: Json = { role: 'assistant', content: text };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
   return {
     id: 'chatcmpl-sim',
     object: 'chat.completion',
@@ -735,7 +736,7 @@ export function anthropicToOpenAIResponse(body: Json, model: string): Json {
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content: text, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) },
+        message,
         finish_reason: stopReasonToOpenAI(body.stop_reason),
         logprobs: null,
       },
@@ -749,77 +750,166 @@ function openAIChunk(model: string, delta: Json, finish: string | null): Json {
   return { id: 'chatcmpl-sim', object: 'chat.completion.chunk', created: FIXED_OPENAI_CREATED, model, choices: [{ index: 0, delta, finish_reason: finish }] };
 }
 
-/**
- * A buffered Gemini streamGenerateContent answer as an OpenAI SSE stream: the text pieces in order,
- * one finish chunk, the usage chunk the client's usage check reads, then [DONE]. Buffered because the
- * usage only arrives in the last frame, after the text.
- */
-export function geminiStreamToOpenAI(text: string, model: string): string {
-  const pieces: string[] = [];
-  let finishReason: unknown = 'STOP';
-  let inputTokens = 0;
-  let outputTokens = 0;
-  for (const frame of parseSseFrames(text)) {
-    let chunk: unknown;
-    try {
-      chunk = JSON.parse(frame.data);
-    } catch {
-      continue;
+/** A Gemini SSE stream as OpenAI SSE chunks: one per text-bearing frame, then a final usage chunk. */
+export async function* geminiStreamToOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let last: { inputTokens: number; outputTokens: number; finishReason: unknown } | null = null;
+  let sawAny = false;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const parsed of parseSseFrames(`${frame}\n\n`)) {
+          let event: unknown;
+          try {
+            event = JSON.parse(parsed.data);
+          } catch {
+            continue;
+          }
+          if (!isRecord(event)) continue;
+          const answer = geminiTextOf(event);
+          last = { inputTokens: answer.inputTokens, outputTokens: answer.outputTokens, finishReason: answer.finishReason };
+          if (answer.text !== '') {
+            sawAny = true;
+            yield `data: ${JSON.stringify(openAIChunk(model, { content: answer.text }, null))}\n\n`;
+          }
+        }
+        at = buffer.indexOf('\n\n');
+      }
     }
-    if (!isRecord(chunk)) continue;
-    const answer = geminiTextOf(chunk);
-    if (answer.text !== '') pieces.push(answer.text);
-    if (chunk.candidates !== undefined) finishReason = answer.finishReason;
-    if (isRecord(chunk.usageMetadata)) {
-      inputTokens = answer.inputTokens;
-      outputTokens = answer.outputTokens;
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const parsed of parseSseFrames(buffer)) {
+        let event: unknown;
+        try {
+          event = JSON.parse(parsed.data);
+        } catch {
+          continue;
+        }
+        if (!isRecord(event)) continue;
+        const answer = geminiTextOf(event);
+        last = { inputTokens: answer.inputTokens, outputTokens: answer.outputTokens, finishReason: answer.finishReason };
+        if (answer.text !== '') {
+          sawAny = true;
+          yield `data: ${JSON.stringify(openAIChunk(model, { content: answer.text }, null))}\n\n`;
+        }
+      }
     }
+  } finally {
+    reader.releaseLock();
   }
-  const out: string[] = [sseEvent(null, openAIChunk(model, { role: 'assistant', content: '' }, null))];
-  for (const piece of pieces) out.push(sseEvent(null, openAIChunk(model, { content: piece }, null)));
-  out.push(sseEvent(null, openAIChunk(model, {}, stopReasonToOpenAI(finishReason))));
-  out.push(
-    sseEvent(null, {
-      id: 'chatcmpl-sim',
-      object: 'chat.completion.chunk',
-      created: FIXED_OPENAI_CREATED,
-      model,
-      choices: [],
-      usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
-    }),
-  );
-  out.push('data: [DONE]\n\n');
-  return out.join('');
+  if (last === null) {
+    yield `data: ${JSON.stringify({ ...openAIChunk(model, { content: '' }, 'stop'), usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })}\n\n`;
+  } else {
+    if (!sawAny) yield `data: ${JSON.stringify(openAIChunk(model, { content: '' }, stopReasonToOpenAI(last.finishReason)))}\n\n`;
+    yield `data: ${JSON.stringify({
+      ...openAIChunk(model, {}, stopReasonToOpenAI(last.finishReason)),
+      usage: { prompt_tokens: last.inputTokens, completion_tokens: last.outputTokens, total_tokens: last.inputTokens + last.outputTokens },
+    })}\n\n`;
+  }
+  yield 'data: [DONE]\n\n';
 }
 
-/**
- * A buffered Gemini streamGenerateContent answer as an Anthropic SSE stream: message_start carrying
- * the input tokens (known only once the whole stream is read, hence buffered), one text block with
- * the pieces, message_delta with the stop reason and output tokens, then message_stop.
- */
-export function geminiStreamToAnthropic(text: string, model: string): string {
-  const pieces: string[] = [];
-  let finishReason: unknown = 'STOP';
-  let inputTokens = 0;
+/** A Gemini SSE stream as Anthropic events. */
+export async function* geminiStreamToAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let started = false;
+  let closedText = false;
   let outputTokens = 0;
-  for (const frame of parseSseFrames(text)) {
-    let chunk: unknown;
-    try {
-      chunk = JSON.parse(frame.data);
-    } catch {
-      continue;
+  let heldStop = 'end_turn';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const parsed of parseSseFrames(`${frame}\n\n`)) {
+          let event: unknown;
+          try {
+            event = JSON.parse(parsed.data);
+          } catch {
+            continue;
+          }
+          if (!isRecord(event)) continue;
+          const answer = geminiTextOf(event);
+          outputTokens = answer.outputTokens;
+          heldStop = stopReasonToAnthropic(answer.finishReason);
+          if (answer.text !== '') {
+            if (!started) {
+              started = true;
+              yield sseEvent('message_start', {
+                type: 'message_start',
+                message: {
+                  id: 'msg_stream',
+                  type: 'message',
+                  role: 'assistant',
+                  model,
+                  content: [],
+                  stop_reason: null,
+                  stop_sequence: null,
+                  usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
+                },
+              });
+              yield sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+            }
+            yield sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } });
+          }
+        }
+        at = buffer.indexOf('\n\n');
+      }
     }
-    if (!isRecord(chunk)) continue;
-    const answer = geminiTextOf(chunk);
-    if (answer.text !== '') pieces.push(answer.text);
-    if (chunk.candidates !== undefined) finishReason = answer.finishReason;
-    if (isRecord(chunk.usageMetadata)) {
-      inputTokens = answer.inputTokens;
-      outputTokens = answer.outputTokens;
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const parsed of parseSseFrames(buffer)) {
+        let event: unknown;
+        try {
+          event = JSON.parse(parsed.data);
+        } catch {
+          continue;
+        }
+        if (!isRecord(event)) continue;
+        const answer = geminiTextOf(event);
+        outputTokens = answer.outputTokens;
+        heldStop = stopReasonToAnthropic(answer.finishReason);
+        if (answer.text !== '') {
+          if (!started) {
+            started = true;
+            yield sseEvent('message_start', {
+              type: 'message_start',
+              message: {
+                id: 'msg_stream',
+                type: 'message',
+                role: 'assistant',
+                model,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
+              },
+            });
+            yield sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+          }
+          yield sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } });
+        }
+      }
     }
+  } finally {
+    reader.releaseLock();
   }
-  const out: string[] = [
-    sseEvent('message_start', {
+  if (!started) {
+    yield sseEvent('message_start', {
       type: 'message_start',
       message: {
         id: 'msg_stream',
@@ -829,134 +919,88 @@ export function geminiStreamToAnthropic(text: string, model: string): string {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: 0 },
+        usage: { input_tokens: 0, output_tokens: 0 },
       },
-    }),
-    sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
-  ];
-  for (const piece of pieces) out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } }));
-  out.push(
-    sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 }),
-    sseEvent('message_delta', {
-      type: 'message_delta',
-      delta: { stop_reason: stopReasonToAnthropic(finishReason), stop_sequence: null },
-      usage: { output_tokens: outputTokens },
-    }),
-    sseEvent('message_stop', { type: 'message_stop' }),
-  );
-  return out.join('');
+    });
+  } else if (closedText) {
+    yield sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+  }
+  yield sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: heldStop, stop_sequence: null }, usage: { output_tokens: outputTokens } });
+  yield sseEvent('message_stop', { type: 'message_stop' });
 }
 
-/**
- * A buffered Anthropic Messages stream as an OpenAI SSE stream: the text deltas and tool-call deltas
- * in order, one finish chunk, the usage chunk, then [DONE].
- */
-export function anthropicStreamToOpenAI(text: string, model: string): string {
-  const out: string[] = [];
-  let started = false;
+/** An Anthropic SSE stream as OpenAI SSE chunks: one per text delta, then a final usage chunk. */
+export async function* anthropicStreamToOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
   let inputTokens = 0;
   let outputTokens = 0;
-  let stopReason: unknown = 'end_turn';
-  let sawToolCalls = false;
-  const toolIndexes = new Map<number, number>();
-  let nextToolIndex = 0;
-
-  const start = (): void => {
-    if (started) return;
-    started = true;
-    out.push(sseEvent(null, openAIChunk(model, { role: 'assistant', content: '' }, null)));
-  };
-
-  for (const frame of parseSseFrames(text)) {
-    if (frame.event === null) continue;
-    let data: unknown;
-    try {
-      data = JSON.parse(frame.data);
-    } catch {
-      continue;
-    }
-    if (!isRecord(data)) continue;
-    switch (frame.event) {
-      case 'message_start': {
-        if (isRecord(data.message) && isRecord(data.message.usage)) inputTokens = numberOrZero(data.message.usage.input_tokens);
-        start();
-        break;
-      }
-      case 'content_block_start': {
-        start();
-        const block = isRecord(data.content_block) ? data.content_block : {};
-        const upstreamIndex = typeof data.index === 'number' ? data.index : -1;
-        if (block.type === 'tool_use') {
-          sawToolCalls = true;
-          const index = nextToolIndex;
-          nextToolIndex += 1;
-          toolIndexes.set(upstreamIndex, index);
-          out.push(
-            sseEvent(
-              null,
-              openAIChunk(model, {
-                tool_calls: [
-                  {
-                    index,
-                    id: typeof block.id === 'string' && block.id !== '' ? block.id : `toolu_${index}`,
-                    type: 'function',
-                    function: { name: typeof block.name === 'string' ? block.name : '', arguments: '' },
-                  },
-                ],
-              }, null),
-            ),
-          );
+  let heldStop = 'stop';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const parsed of parseSseFrames(`${frame}\n\n`)) {
+          let event: unknown;
+          try {
+            event = JSON.parse(parsed.data);
+          } catch {
+            continue;
+          }
+          if (!isRecord(event)) continue;
+          if (event.type === 'message_start' && isRecord(event.message) && isRecord(event.message.usage)) {
+            inputTokens = numberOrZero(event.message.usage.input_tokens);
+          }
+          if (event.type === 'content_block_delta' && isRecord(event.delta) && event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
+            yield `data: ${JSON.stringify(openAIChunk(model, { content: event.delta.text }, null))}\n\n`;
+          }
+          if (event.type === 'message_delta' && isRecord(event.delta)) {
+            if (typeof event.delta.stop_reason === 'string') heldStop = stopReasonToOpenAI(event.delta.stop_reason);
+            if (isRecord(event.usage)) outputTokens = numberOrZero(event.usage.output_tokens);
+          }
         }
-        break;
+        at = buffer.indexOf('\n\n');
       }
-      case 'content_block_delta': {
-        start();
-        const delta = isRecord(data.delta) ? data.delta : {};
-        const upstreamIndex = typeof data.index === 'number' ? data.index : -1;
-        if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
-          out.push(sseEvent(null, openAIChunk(model, { content: delta.text }, null)));
-        } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string' && delta.partial_json !== '') {
-          const index = toolIndexes.get(upstreamIndex) ?? 0;
-          out.push(
-            sseEvent(
-              null,
-              openAIChunk(model, { tool_calls: [{ index, function: { arguments: delta.partial_json } }] }, null),
-            ),
-          );
-        }
-        break;
-      }
-      case 'message_delta': {
-        const delta = isRecord(data.delta) ? data.delta : {};
-        if (typeof delta.stop_reason === 'string') stopReason = delta.stop_reason;
-        if (isRecord(data.usage)) outputTokens = numberOrZero(data.usage.output_tokens);
-        break;
-      }
-      case 'message_stop':
-      case 'content_block_stop':
-      case 'ping':
-        break;
-      default:
-        break;
     }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const parsed of parseSseFrames(buffer)) {
+        let event: unknown;
+        try {
+          event = JSON.parse(parsed.data);
+        } catch {
+          continue;
+        }
+        if (!isRecord(event)) continue;
+        if (event.type === 'message_start' && isRecord(event.message) && isRecord(event.message.usage)) {
+          inputTokens = numberOrZero(event.message.usage.input_tokens);
+        }
+        if (event.type === 'content_block_delta' && isRecord(event.delta) && event.delta.type === 'text_delta' && typeof event.delta.text === 'string') {
+          yield `data: ${JSON.stringify(openAIChunk(model, { content: event.delta.text }, null))}\n\n`;
+        }
+        if (event.type === 'message_delta' && isRecord(event.delta)) {
+          if (typeof event.delta.stop_reason === 'string') heldStop = stopReasonToOpenAI(event.delta.stop_reason);
+          if (isRecord(event.usage)) outputTokens = numberOrZero(event.usage.output_tokens);
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
   }
-  start();
-  out.push(sseEvent(null, openAIChunk(model, {}, sawToolCalls ? 'tool_calls' : stopReasonToOpenAI(stopReason))));
-  out.push(
-    sseEvent(null, {
-      id: 'chatcmpl-sim',
-      object: 'chat.completion.chunk',
-      created: FIXED_OPENAI_CREATED,
-      model,
-      choices: [],
-      usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
-    }),
-  );
-  out.push('data: [DONE]\n\n');
-  return out.join('');
+  yield `data: ${JSON.stringify({
+    ...openAIChunk(model, {}, heldStop),
+    usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+  })}\n\n`;
+  yield 'data: [DONE]\n\n';
 }
 
-/** One OpenAI content part as an Anthropic content block: text or an image; null for the rest. */
+/** One OpenAI content part as an Anthropic content block. */
 function anthropicBlockOf(part: Json): Json | null {
   if (part.type === 'text' && typeof part.text === 'string') return { type: 'text', text: part.text };
   if (part.type === 'image_url' && isRecord(part.image_url) && typeof part.image_url.url === 'string') {
@@ -970,44 +1014,37 @@ function anthropicBlockOf(part: Json): Json | null {
   return null;
 }
 
-/** OpenAI message content as Anthropic message content: a string stays a string, parts become blocks. */
-function anthropicContentOf(content: unknown): string | Json[] | null {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return null;
-  const blocks: Json[] = [];
-  for (const block of content) {
-    if (!isRecord(block)) continue;
-    const converted = anthropicBlockOf(block);
-    if (converted !== null) blocks.push(converted);
-  }
-  return blocks.length > 0 ? blocks : null;
+/** OpenAI content (a string or a part array) as Anthropic content blocks. */
+function anthropicContentOf(content: unknown): Json[] {
+  if (typeof content === 'string') return content === '' ? [] : [{ type: 'text', text: content }];
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((p) => {
+    if (!isRecord(p)) return [];
+    const block = anthropicBlockOf(p);
+    return block === null ? [] : [block];
+  });
 }
 
 /**
- * An OpenAI Chat Completions request as an Anthropic Messages request that names `model`: the system
- * messages become the system prompt, image_url parts become image blocks with the same base64 bytes,
- * tool_calls become tool_use blocks, tool messages become tool_result blocks, tools and tool_choice
- * are rewritten, and the output cap, temperature, top_p, stop sequences and streaming pass through.
- * (The reverse direction, anthropicToOpenAI, reads an Anthropic body; an OpenAI body fed to it would
- * lose the system prompt and the stops, because it looks for a top-level `system` and
- * `stop_sequences` the OpenAI body does not carry.)
+ * A Chat Completions request as an Anthropic Messages request: the system prompt becomes the system
+ * field, messages become Anthropic's message shapes (tool calls become tool_use blocks, tool messages
+ * become tool_result blocks, images become image blocks), tools and tool_choice are rewritten, and
+ * max_tokens, temperature, top_p, stop and streaming pass through.
  */
-export function openAIRequestToAnthropic(body: Json, model: string): Json {
-  const systemParts: string[] = [];
+export function openAIRequestToAnthropic(body: Json, maxTokens: number): Json {
   const messages: Json[] = [];
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    if (raw.role === 'system') {
-      const text = textOf(raw.content);
-      if (text !== '') systemParts.push(text);
+  const systems: string[] = [];
+  const incoming = Array.isArray(body.messages) ? body.messages : [];
+  for (const msg of incoming) {
+    if (!isRecord(msg)) continue;
+    if (msg.role === 'system') {
+      const text = textOf(msg.content);
+      if (text !== '') systems.push(text);
       continue;
     }
-    if (raw.role === 'assistant') {
-      const content: Json[] = [];
-      const text = textOf(raw.content);
-      if (text !== '') content.push({ type: 'text', text });
-      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+    if (msg.role === 'assistant') {
+      const content: Json[] = anthropicContentOf(msg.content);
+      const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       for (const call of calls) {
         if (!isRecord(call) || !isRecord(call.function)) continue;
         content.push({
@@ -1017,29 +1054,31 @@ export function openAIRequestToAnthropic(body: Json, model: string): Json {
           input: argumentsOf(call.function.arguments),
         });
       }
-      messages.push({ role: 'assistant', content: content.length > 0 ? content : '' });
+      if (content.length > 0) messages.push({ role: 'assistant', content });
       continue;
     }
-    if (raw.role === 'tool') {
-      const text = typeof raw.content === 'string' ? raw.content : textOf(raw.content);
+    if (msg.role === 'tool') {
       messages.push({
         role: 'user',
-        content: [{ type: 'tool_result', tool_use_id: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : '', content: text }],
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: typeof msg.tool_call_id === 'string' ? msg.tool_call_id : '',
+            content: typeof msg.content === 'string' ? msg.content : textOf(msg.content),
+          },
+        ],
       });
       continue;
     }
-    const content = anthropicContentOf(raw.content);
-    if (content !== null) messages.push({ role: 'user', content });
+    const content = anthropicContentOf(msg.content);
+    if (content.length > 0) messages.push({ role: 'user', content });
   }
 
-  const out: Json = { model, messages };
-  if (systemParts.length > 0) out.system = systemParts.join('\n');
-  const maxTokens = openAIMaxTokens(body);
-  if (maxTokens !== undefined) out.max_tokens = maxTokens;
+  const out: Json = { model: typeof body.model === 'string' ? body.model : '', messages, max_tokens: maxTokens };
+  if (systems.length > 0) out.system = systems.join('\n');
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
-  const stops = stringListOf(body.stop);
-  if (stops.length > 0) out.stop_sequences = stops;
+  if (Array.isArray(body.stop)) out.stop_sequences = body.stop;
   if (Array.isArray(body.tools)) {
     const tools = body.tools.flatMap((raw) => {
       if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') return [];
@@ -1055,7 +1094,7 @@ export function openAIRequestToAnthropic(body: Json, model: string): Json {
   }
   const choice = body.tool_choice;
   if (choice === 'auto') out.tool_choice = { type: 'auto' };
-  else if (choice === 'required') out.tool_choice = { type: 'any' };
+  else if (choice === 'required' || choice === 'any') out.tool_choice = { type: 'any' };
   else if (isRecord(choice) && choice.type === 'function' && isRecord(choice.function) && typeof choice.function.name === 'string') {
     out.tool_choice = { type: 'tool', name: choice.function.name };
   }

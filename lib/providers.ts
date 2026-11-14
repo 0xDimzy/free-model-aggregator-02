@@ -172,21 +172,19 @@ export function authHeaders(auth: AuthScheme, key: string): Record<string, strin
 function objectEnd(text: string, start: number): number {
   let depth = 0;
   let inString = false;
-  let i = start;
-  while (i < text.length) {
+  for (let i = start; i < text.length; i += 1) {
     const ch = text[i];
     if (inString) {
       if (ch === '\\') i += 1;
       else if (ch === '"') inString = false;
-    } else if (ch === '"') {
-      inString = true;
-    } else if (ch === '{') {
-      depth += 1;
-    } else if (ch === '}') {
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth += 1;
+    else if (ch === '}') {
       depth -= 1;
       if (depth === 0) return i;
     }
-    i += 1;
   }
   return -1;
 }
@@ -230,9 +228,10 @@ function providerOf(v: unknown): ProviderDirectoryEntry | null {
   const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
   // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
   // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
-  const base =
-    stringOf(v.path) !== '' ? stringOf(v.path) : stringOf(v.base_path) !== '' ? stringOf(v.base_path) : stringOf(v.base_url) !== '' ? stringOf(v.base_url) : stringOf(v.base);
-  return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
+  const baseCandidates = [stringOf(v.path), stringOf(v.base_path), stringOf(v.base_url), stringOf(v.base)];
+  const base = baseCandidates.find((candidate) => candidate !== '') ?? '';
+  const name = stringOf(v.name) !== '' ? stringOf(v.name) : id;
+  return { id, name, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
 }
 
 function ratingOf(v: unknown): RatingRow | null {
@@ -257,7 +256,8 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
   const id = stringOf(v.id);
   if (id === '') return null;
   const requires = isRecord(v.requires) ? v.requires : {};
-  const minContext = typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {};
+  const minContext =
+    typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {};
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
@@ -273,7 +273,7 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
 }
 
 /** The quality table parsed from its document, or null when the document has no ratings array. */
-function ratingsFrom(doc: Json | null): RatingsFile | null {
+function parseRatings(doc: Json | null): RatingsFile | null {
   if (doc === null || !Array.isArray(doc.ratings)) return null;
   const ratings = doc.ratings.flatMap((v) => {
     const r = ratingOf(v);
@@ -289,13 +289,21 @@ function ratingsFrom(doc: Json | null): RatingsFile | null {
 }
 
 /** The workload manifest parsed from its document, or null when it has no manifest array. */
-function workloadFrom(doc: Json | null): WorkloadFile | null {
+function parseWorkload(doc: Json | null): WorkloadFile | null {
   if (doc === null || !Array.isArray(doc.manifest)) return null;
   const manifest = doc.manifest.flatMap((v) => {
     const w = workloadRequestOf(v);
     return w === null ? [] : [w];
   });
   return { schema: WORKLOAD_SCHEMA, manifest };
+}
+
+/** The document with one schema, when the brief holds one with the required array member. */
+function findDoc(docs: Json[], schema: string, member: string): Json | null {
+  for (const doc of docs) {
+    if (doc.schema === schema && Array.isArray(doc[member])) return doc;
+  }
+  return null;
 }
 
 /** The brief at `path`, its three documents found by schema. */
@@ -309,7 +317,7 @@ export function readBrief(path: string): Brief {
     return { directory, ratings: null, workload: null, error: `cannot read ${path}: ${(err as Error).message}` };
   }
   const docs = documentsIn(text);
-  const directoryDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
+  const directoryDoc = findDoc(docs, PROVIDERS_SCHEMA, 'providers');
   if (directoryDoc === null || !Array.isArray(directoryDoc.providers)) {
     return { directory, ratings: null, workload: null, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
   }
@@ -317,10 +325,8 @@ export function readBrief(path: string): Brief {
     const p = providerOf(v);
     return p === null ? [] : [p];
   });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
-  const ratings = ratingsFrom(ratingsDoc);
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload = workloadFrom(workloadDoc);
+  const ratings = parseRatings(findDoc(docs, RATINGS_SCHEMA, 'ratings'));
+  const workload = parseWorkload(findDoc(docs, WORKLOAD_SCHEMA, 'manifest'));
   return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
 }
 
@@ -377,11 +383,13 @@ function modelIn(wire: Wire, v: unknown): ProbedModel | null {
   const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
   if (id === '') return null;
   const displayName = stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id;
-  const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
+  const context =
+    numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
+  const free = boolOrNull(v.free) ?? zeroPriced(v);
   return {
     id,
     display_name: displayName,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
+    free,
     context_length: context,
     tools: boolOrNull(v.tools),
     vision: boolOrNull(v.vision),
@@ -410,7 +418,9 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
   if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
   let lastError = `GET ${url} failed: no attempt ran`;
   let lastStatus = 0;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  let attempt = 0;
+  while (attempt < 3) {
+    attempt += 1;
     try {
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) {
@@ -442,7 +452,8 @@ export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings:
     if (!probe.ok) continue;
     const seen = new Set<string>();
     const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    const sorted = [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (const model of sorted) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       const row = ratingOfModel(ratings, probe.provider.id, model.id);

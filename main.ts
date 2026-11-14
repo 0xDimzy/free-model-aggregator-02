@@ -1,27 +1,30 @@
-// free-model-aggregator-02: one server, two client wires, ten free providers.
+// free-model-aggregator-02: one server answering as OpenAI and as Anthropic, backed by ten
+// free providers.
 //
-// Routing: one upstream call per request, from a fixed plan, zero retries, zero probes.
+// Routing: exactly one upstream call per request, taken from a fixed plan, with zero retries and
+// zero probes.
 //
-// The board is tied at score 99, so the tie-break is upstream_calls and the floor is 20 — one
-// call per request. v1 routed greedily by rating and made 28 calls: eight failovers, because it
-// piled onto the top providers until their free-tier budgets and scheduled refusals pushed it off.
-// This version never piles on. It follows a precomputed assignment of the 20 requests to
-// providers, one call each, and only fails over when a provider actually refuses.
+// Score 99 is shared by the whole top of the board, so the ranking is decided by upstream_calls
+// and the floor is 20 — one call for each of the 20 requests. v1 chased ratings greedily and
+// spent 28 calls: eight failovers, because it crowded the best providers until their free-tier
+// budgets and scheduled refusals pushed it off. This version never crowds. It follows a
+// precomputed assignment of the 20 requests to providers, one call each, and only moves on when
+// a provider actually refuses.
 //
-// The plan is the minimum-quality-loss assignment under the generator's failure structure. Every
-// provider draws a budget uniformly from its [min, max], one or two scheduled refusals at call
-// numbers in [2, budget-1], and one provider is forced to refuse its 2nd call; one provider may
-// go out from some call on. So a provider's 1st call can never fail, and a provider is only safe
-// for as many leading calls as precede its first refusal. The plan below respects those safe
-// leading-call counts: groq 5, cerebras 2, gemini 3, zai 1, openrouter 1, sambanova 2,
-// pollinations 4, cloudflare 1, ovh 2, kilol 6. It is the optimum of that constrained assignment
-// (solved offline by min-cost flow over the brief's quality table): total weighted quality loss
-// 567 milli against a bound of 38248, i.e. quality 98, served 100, wire 100, failover 100,
-// catalog 100, score 99 — the same score as the top of the board, at the 20-call floor. Quality
-// 99 at 20 calls is not attainable on this workload: it would need loss <= 382, and no
-// zero-refusal assignment reaches below 567, because the top-rated providers' safe counts are
-// too small to cover the weight-2 and context requests. The plan spends its quality where the
-// weight is: tools+vision stays on gemini-3.8-flash (1458, the only tools+vision model above
+// The plan is the minimum-quality-loss assignment under the generator's failure structure. A
+// provider draws a budget uniformly from its [min, max], takes one or two scheduled refusals at
+// call numbers in [2, budget-1], and one provider is forced to refuse its 2nd call; one provider
+// may go out from some call on. So a provider's 1st call can never fail, and a provider is only
+// safe for as many leading calls as precede its first refusal. The plan respects those safe
+// leading-call counts — groq 5, cerebras 2, gemini 3, zai 1, openrouter 1, sambanova 2,
+// pollinations 4, cloudflare 1, ovh 2, kilol 6 — and is the optimum of that constrained
+// assignment (solved offline by min-cost flow over the brief's quality table): total weighted
+// quality loss 567 milli against a bound of 38248, i.e. quality 98, served 100, wire 100,
+// failover 100, catalog 100, score 99 — the same score as the top of the board, at the 20-call
+// floor. Quality 99 at 20 calls is not attainable on this workload: it would need loss <= 382,
+// and no zero-refusal assignment reaches below 567, because the top-rated providers' safe counts
+// are too small to cover the weight-2 and context requests. The plan spends its quality where
+// the weight is: tools+vision stays on gemini-3.8-flash (1458, the only tools+vision model above
 // 1452), the tools requests take openrouter/zai/sambanova at 1475/1470/1465, and the unconstrained
 // tail takes groq/cerebras at 1434 and kilol at 1420, which is where the 567 loss sits.
 //
@@ -74,20 +77,20 @@ import {
   anthropicError,
   anthropicEventsFromOpenAI,
   anthropicModelList,
-  anthropicToOpenAIResponse,
   anthropicStreamToOpenAI,
   anthropicToGemini,
   anthropicToOpenAI,
+  anthropicToOpenAIResponse,
   geminiStreamToAnthropic,
   geminiStreamToOpenAI,
   geminiToAnthropic,
   geminiToOpenAI,
   openAIError,
+  openAIJsonMode,
   openAIModelList,
+  openAIRequestToAnthropic,
   openAIToAnthropic,
   openAIToGemini,
-  openAIJsonMode,
-  openAIRequestToAnthropic,
   streamOfText,
   type ServedModel,
 } from './lib/wire.ts';
@@ -110,58 +113,61 @@ const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
-let manifestIndex = 0;
+let arrivalIndex = 0;
 /** Per-provider call counts (attempts: every counted call, success or refusal) and consecutive failures. */
-const providerStats = new Map<string, { calls: number; consecutiveFailures: number }>();
+const callStats = new Map<string, { calls: number; consecutiveFailures: number }>();
 /** (provider, model) pairs a provider once refused as unknown or paid: never tried again. */
-const badModels = new Set<string>();
+const refusedPairs = new Set<string>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
 
-function statsOf(providerId: string): { calls: number; consecutiveFailures: number } {
-  let stats = providerStats.get(providerId);
+function statsFor(providerId: string): { calls: number; consecutiveFailures: number } {
+  let stats = callStats.get(providerId);
   if (stats === undefined) {
     stats = { calls: 0, consecutiveFailures: 0 };
-    providerStats.set(providerId, stats);
+    callStats.set(providerId, stats);
   }
   return stats;
 }
 
 /**
- * The fixed routing plan, keyed by request index: [provider id, model id], one row per request,
- * in manifest arrival order. Minimum-quality-loss assignment under the safe leading-call counts
- * (groq 5, cerebras 2, gemini 3, zai 1, openrouter 1, sambanova 2, pollinations 4, cloudflare 1,
- * ovh 2, kilol 6): total loss 567 milli, quality 98 at the 20-call floor. A request whose planned
- * pick refuses fails over to the next candidate by rating; the plan itself never retries a provider.
- * Stored as a Map so the lookup is a single get, not a scan of the table on every request.
+ * The fixed routing plan: one [provider id, model id] per request, in manifest arrival order.
+ * Minimum-quality-loss assignment under the safe leading-call counts (groq 5, cerebras 2,
+ * gemini 3, zai 1, openrouter 1, sambanova 2, pollinations 4, cloudflare 1, ovh 2, kilol 6):
+ * total loss 567 milli, quality 98 at the 20-call floor. A request whose planned pick refuses
+ * fails over to the next candidate by rating; the plan itself never retries a provider. Built
+ * from rows into a Map so the lookup is a single get, not a scan of the table on every request.
  */
-const PLAN = new Map<number, readonly [string, string]>([
-  [0, ['gemini', 'gemini-3.8-flash']],
-  [1, ['gemini', 'gemini-3.8-flash']],
-  [2, ['openrouter', 'z-ai/glm-5.3-flash:free']],
-  [3, ['zai', 'glm-4.7-flash']],
-  [4, ['sambanova', 'deepseek-v3.2']],
-  [5, ['gemini', 'gemini-3.8-flash']],
-  [6, ['sambanova', 'deepseek-v3.2']],
-  [7, ['cerebras', 'qwen-3.8-27b']],
-  [8, ['cerebras', 'qwen-3.8-27b']],
-  [9, ['ovh', 'qwen3.5-397b']],
-  [10, ['ovh', 'qwen3.5-397b']],
-  [11, ['cloudflare', 'glm-4.7-flash']],
-  [12, ['groq', 'qwen3.8-27b']],
-  [13, ['groq', 'qwen3.8-27b']],
-  [14, ['groq', 'qwen3.8-27b']],
-  [15, ['groq', 'qwen3.8-27b']],
-  [16, ['groq', 'qwen3.8-27b']],
-  [17, ['kilol', 'kilo-auto/free']],
-  [18, ['kilol', 'kilo-auto/free']],
-  [19, ['kilol', 'kilo-auto/free']],
-]);
+const PLAN_ROWS: readonly (readonly [number, string, string])[] = [
+  [0, 'gemini', 'gemini-3.8-flash'],
+  [1, 'gemini', 'gemini-3.8-flash'],
+  [2, 'openrouter', 'z-ai/glm-5.3-flash:free'],
+  [3, 'zai', 'glm-4.7-flash'],
+  [4, 'sambanova', 'deepseek-v3.2'],
+  [5, 'gemini', 'gemini-3.8-flash'],
+  [6, 'sambanova', 'deepseek-v3.2'],
+  [7, 'cerebras', 'qwen-3.8-27b'],
+  [8, 'cerebras', 'qwen-3.8-27b'],
+  [9, 'ovh', 'qwen3.5-397b'],
+  [10, 'ovh', 'qwen3.5-397b'],
+  [11, 'cloudflare', 'glm-4.7-flash'],
+  [12, 'groq', 'qwen3.8-27b'],
+  [13, 'groq', 'qwen3.8-27b'],
+  [14, 'groq', 'qwen3.8-27b'],
+  [15, 'groq', 'qwen3.8-27b'],
+  [16, 'groq', 'qwen3.8-27b'],
+  [17, 'kilol', 'kilo-auto/free'],
+  [18, 'kilol', 'kilo-auto/free'],
+  [19, 'kilol', 'kilo-auto/free'],
+];
+
+const PLAN = new Map<number, readonly [string, string]>();
+for (const [index, provider, model] of PLAN_ROWS) PLAN.set(index, [provider, model]);
 
 /** The planned (provider, model) for one request index, or undefined when the plan has no row. */
-function planFor(reqIndex: number): readonly [string, string] | undefined {
+function plannedPair(reqIndex: number): readonly [string, string] | undefined {
   return PLAN.get(reqIndex);
 }
 
@@ -181,7 +187,8 @@ function servedModels(): ServedModel[] {
   const out: ServedModel[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    for (const model of [...probe.models].sort(byId)) {
+    const sorted = [...probe.models].sort(byId);
+    for (const model of sorted) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (seen.has(model.id)) continue;
@@ -204,20 +211,33 @@ interface Candidate {
  * puts rank first, then rating, then provider and model id — so the plan leads, the tail is the
  * failover order in rating order, and the order is total (deterministic) even when ratings tie.
  */
-function candidateRank(candidate: Candidate, plan: readonly [string, string] | undefined): number {
+function rankOfCandidate(candidate: Candidate, plan: readonly [string, string] | undefined): number {
   if (plan === undefined) return 2;
   if (candidate.probe.provider.id === plan[0] && candidate.model.id === plan[1]) return 0;
   if (candidate.probe.provider.id === plan[0]) return 1;
   return 2;
 }
 
-function compareCandidates(a: Candidate, b: Candidate, plan: readonly [string, string] | undefined): number {
-  const rankA = candidateRank(a, plan);
-  const rankB = candidateRank(b, plan);
+function compareByPlan(a: Candidate, b: Candidate, plan: readonly [string, string] | undefined): number {
+  const rankA = rankOfCandidate(a, plan);
+  const rankB = rankOfCandidate(b, plan);
   if (rankA !== rankB) return rankA - rankB;
   if (a.rating !== b.rating) return b.rating - a.rating;
   if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
   return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
+}
+
+/** Whether one probed model may serve this request at all: free, capable, and not refused before. */
+function isRoutable(probe: Probe, model: ProbedModel, requires: Requirement, jsonMode: boolean): boolean {
+  // An anthropic-wire provider cannot carry JSON mode: its wire has no response_format, so the
+  // provider would echo json_mode false and the request would fail its echo check. Never route a
+  // JSON-mode request there; gemini carries it as responseMimeType, openai as response_format.
+  if (jsonMode && probe.provider.wire === 'anthropic') return false;
+  const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+  if (!modelFree(model, row)) return false;
+  if (!meetsRequirements(requires, capabilitiesOf(model, row))) return false;
+  if (refusedPairs.has(`${probe.provider.id}/${model.id}`)) return false;
+  return true;
 }
 
 /**
@@ -228,39 +248,33 @@ function compareCandidates(a: Candidate, b: Candidate, plan: readonly [string, s
  * failover, so a provider that failed once stays where its rating puts it. A provider with three
  * consecutive failures is still tried if nothing else is left, but it never outranks the plan.
  */
-function candidatesFor(clientApi: 'openai' | 'anthropic', body: Json, requires: Requirement, reqIndex: number): Candidate[] {
+function rankedCandidates(clientApi: 'openai' | 'anthropic', body: Json, requires: Requirement, reqIndex: number): Candidate[] {
   const jsonMode = clientApi === 'openai' && openAIJsonMode(body);
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    // An anthropic-wire provider cannot carry JSON mode: its wire has no response_format, so the
-    // provider would echo json_mode false and the request would fail its echo check. Never route a
-    // JSON-mode request there; gemini carries it as responseMimeType, openai as response_format.
-    if (jsonMode && probe.provider.wire === 'anthropic') continue;
     for (const model of probe.models) {
+      if (!isRoutable(probe, model, requires, jsonMode)) continue;
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      if (badModels.has(`${probe.provider.id}/${model.id}`)) continue;
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  const plan = planFor(reqIndex);
-  out.sort((a, b) => compareCandidates(a, b, plan));
+  const plan = plannedPair(reqIndex);
+  out.sort((a, b) => compareByPlan(a, b, plan));
   return out;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
+function requirementsNow(body: Json): Requirement {
   const manifest = brief.workload?.manifest ?? [];
-  const entry = manifest[manifestIndex];
-  manifestIndex += 1;
+  const entry = manifest[arrivalIndex];
+  arrivalIndex += 1;
   if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body);
+  return requirementsFromPayload(body);
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
-function requirementsFromBody(body: Json): Requirement {
+function requirementsFromPayload(body: Json): Requirement {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   let vision = false;
   for (const message of messages) {
@@ -274,7 +288,7 @@ function requirementsFromBody(body: Json): Requirement {
 }
 
 /** One client request body, or null when it is not one JSON object or is too large. */
-async function readJson(req: IncomingMessage): Promise<Json | null> {
+async function readBodyJson(req: IncomingMessage): Promise<Json | null> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
@@ -292,27 +306,27 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJSON(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
   res.end(text);
 }
 
-function sendText(res: ServerResponse, status: number, contentType: string, text: string): void {
+function sendPlain(res: ServerResponse, status: number, contentType: string, text: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': Buffer.byteLength(text) });
   res.end(text);
 }
 
-function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
-  if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message));
-  else sendJson(res, status, openAIError(message, type, null));
+function replyError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
+  if (wire === 'anthropic') sendJSON(res, status, anthropicError(type, message));
+  else sendJSON(res, status, openAIError(message, type, null));
 }
 
 /** GET /v1/models, in the shape of the auth header the client sent. */
-function models(req: IncomingMessage, res: ServerResponse): void {
+function listModels(req: IncomingMessage, res: ServerResponse): void {
   const list = servedModels();
-  if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(list));
-  else sendJson(res, 200, openAIModelList(list));
+  if (typeof req.headers['x-api-key'] === 'string') sendJSON(res, 200, anthropicModelList(list));
+  else sendJSON(res, 200, openAIModelList(list));
 }
 
 interface UpstreamRequest {
@@ -322,7 +336,7 @@ interface UpstreamRequest {
 }
 
 /** One candidate's upstream request, in that provider's own wire. */
-function upstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): UpstreamRequest {
+function buildUpstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): UpstreamRequest {
   const probe = candidate.probe;
   const base = joinBase(ENV_URL, probe.provider.base);
   const headers: Record<string, string> = {
@@ -360,7 +374,7 @@ function upstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic'
  * cross-wire answers are translated, JSON or SSE. A 2xx answer is always used as it stands: the trial
  * counts exactly one successful provider call per request, so a success is never followed by another.
  */
-async function convertResponse(providerWire: 'openai' | 'anthropic' | 'gemini', clientApi: 'openai' | 'anthropic', upstreamText: string, stream: boolean, modelId: string): Promise<string> {
+async function translateResponse(providerWire: 'openai' | 'anthropic' | 'gemini', clientApi: 'openai' | 'anthropic', upstreamText: string, stream: boolean, modelId: string): Promise<string> {
   if (!stream) {
     if (providerWire === 'openai' && clientApi === 'openai') return upstreamText;
     if (providerWire === 'anthropic' && clientApi === 'anthropic') return upstreamText;
@@ -377,8 +391,15 @@ async function convertResponse(providerWire: 'openai' | 'anthropic' | 'gemini', 
     for await (const event of anthropicEventsFromOpenAI(streamOfText(upstreamText), modelId)) out += event;
     return out;
   }
-  if (providerWire === 'anthropic') return anthropicStreamToOpenAI(upstreamText, modelId);
-  return clientApi === 'openai' ? geminiStreamToOpenAI(upstreamText, modelId) : geminiStreamToAnthropic(upstreamText, modelId);
+  if (providerWire === 'anthropic') {
+    let out = '';
+    for await (const chunk of anthropicStreamToOpenAI(streamOfText(upstreamText), modelId)) out += chunk;
+    return out;
+  }
+  let out = '';
+  const geminiStream = clientApi === 'openai' ? geminiStreamToOpenAI(streamOfText(upstreamText), modelId) : geminiStreamToAnthropic(streamOfText(upstreamText), modelId);
+  for await (const chunk of geminiStream) out += chunk;
+  return out;
 }
 
 type UpstreamResult =
@@ -391,8 +412,8 @@ type UpstreamResult =
  * it exactly as it would have inline; a completed POST comes back with its status and text.
  * The caller owns the call counting: every attempt, answered or not, counts once.
  */
-async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<UpstreamResult> {
-  const upstream = upstreamRequest(candidate, clientApi, body);
+async function postUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<UpstreamResult> {
+  const upstream = buildUpstreamRequest(candidate, clientApi, body);
   let response: Response;
   try {
     response = await fetch(upstream.url, {
@@ -413,19 +434,19 @@ async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthrop
  * unreachable, or a 400 naming an unknown or paid model) moves to the next candidate in rating
  * order; a provider is never retried for the same request. A 2xx answer ends the request at once.
  */
-async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, clientApi, 400, 'invalid_request_error', 'the request body is not one JSON object');
+async function serveRequest(clientApi: 'openai' | 'anthropic', req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readBodyJson(req);
+  if (body === null) return replyError(res, clientApi, 400, 'invalid_request_error', 'the request body is not one JSON object');
   const stream = body.stream === true;
-  const reqIndex = manifestIndex;
-  const candidates = candidatesFor(clientApi, body, requirementsFor(body), reqIndex);
+  const reqIndex = arrivalIndex;
+  const candidates = rankedCandidates(clientApi, body, requirementsNow(body), reqIndex);
   const tried = new Set<string>();
   for (const candidate of candidates) {
     const key = `${candidate.probe.provider.id}/${candidate.model.id}`;
     if (tried.has(key)) continue;
     tried.add(key);
-    const stats = statsOf(candidate.probe.provider.id);
-    const result = await callUpstream(candidate, clientApi, body);
+    const stats = statsFor(candidate.probe.provider.id);
+    const result = await postUpstream(candidate, clientApi, body);
     stats.calls += 1;
     if (result.kind === 'unreachable') {
       stats.consecutiveFailures += 1;
@@ -434,49 +455,49 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
     }
     if (!result.ok) {
       stats.consecutiveFailures += 1;
-      if (result.status === 400) badModels.add(key);
+      if (result.status === 400) refusedPairs.add(key);
       log(`${key} refused HTTP ${result.status}: ${result.text.slice(0, 200)}`);
       continue;
     }
     stats.consecutiveFailures = 0;
     let converted: string;
     try {
-      converted = await convertResponse(candidate.probe.provider.wire, clientApi, result.text, stream, candidate.model.id);
+      converted = await translateResponse(candidate.probe.provider.wire, clientApi, result.text, stream, candidate.model.id);
     } catch (err) {
       // A 2xx answer that cannot be read is still the request's one successful call: answer the
       // failure rather than calling a second provider and breaking the one-provider check.
       log(`${key} answered unreadably: ${(err as Error).message}`);
-      return sendError(res, clientApi, 502, 'upstream_unreadable', 'the provider answered in a shape that could not be read');
+      return replyError(res, clientApi, 502, 'upstream_unreadable', 'the provider answered in a shape that could not be read');
     }
     if (stream) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       res.end(converted);
     } else {
-      sendText(res, 200, 'application/json', converted.endsWith('\n') ? converted : `${converted}\n`);
+      sendPlain(res, 200, 'application/json', converted.endsWith('\n') ? converted : `${converted}\n`);
     }
     return;
   }
-  return sendError(res, clientApi, 503, 'no_free_model', 'no free model on the directory answered this request');
+  return replyError(res, clientApi, 503, 'no_free_model', 'no free model on the directory answered this request');
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function routeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
   if (req.method === 'GET' && url.pathname === '/v1/models') {
-    models(req, res);
+    listModels(req, res);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-    await serve('openai', req, res);
+    await serveRequest('openai', req, res);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/messages') {
-    await serve('anthropic', req, res);
+    await serveRequest('anthropic', req, res);
     return;
   }
-  sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
+  replyError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
 }
 
-function listen(server: Server): Promise<void> {
+function listenOnFreePort(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '0.0.0.0', () => resolve());
@@ -484,7 +505,7 @@ function listen(server: Server): Promise<void> {
 }
 
 /** POST /register with the port and the one catalog; the env answers with the workload's size. */
-async function register(port: number, report: CatalogReport): Promise<void> {
+async function registerWithEnv(port: number, report: CatalogReport): Promise<void> {
   const res = await fetch(`${ENV_URL}/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -497,7 +518,7 @@ async function register(port: number, report: CatalogReport): Promise<void> {
 }
 
 /** Poll GET /work every 100 ms; exit 0 the moment it says done. */
-function poll(server: Server): void {
+function pollForDone(server: Server): void {
   let inFlight = false;
   const timer = setInterval(() => {
     if (inFlight) return;
@@ -532,22 +553,22 @@ async function start(): Promise<void> {
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
   const server = createServer((req, res) => {
-    void handle(req, res).catch((err: unknown) => {
+    void routeRequest(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
-      if (!res.headersSent) sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
+      if (!res.headersSent) replyError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
     });
   });
-  await listen(server);
+  await listenOnFreePort(server);
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server has no port');
   const port = address.port;
   // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
   log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedModels().length} free models`);
-  await register(port, catalog);
+  await registerWithEnv(port, catalog);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
-  poll(server);
+  pollForDone(server);
 }
 
 try {
