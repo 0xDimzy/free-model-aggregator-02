@@ -272,30 +272,40 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
   };
 }
 
-/** The quality table parsed from its document, or null when the document has no ratings array. */
-function parseRatings(doc: Json | null): RatingsFile | null {
-  if (doc === null || !Array.isArray(doc.ratings)) return null;
-  const ratings = doc.ratings.flatMap((v) => {
-    const r = ratingOf(v);
-    return r === null ? [] : [r];
-  });
-  const best = Array.isArray(doc.best)
-    ? doc.best.flatMap((v) => {
-        if (!isRecord(v) || stringOf(v.id) === '') return [];
-        return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
-      })
-    : [];
-  return { schema: RATINGS_SCHEMA, ratings, best };
-}
-
-/** The workload manifest parsed from its document, or null when it has no manifest array. */
-function parseWorkload(doc: Json | null): WorkloadFile | null {
-  if (doc === null || !Array.isArray(doc.manifest)) return null;
-  const manifest = doc.manifest.flatMap((v) => {
-    const w = workloadRequestOf(v);
-    return w === null ? [] : [w];
-  });
-  return { schema: WORKLOAD_SCHEMA, manifest };
+/**
+ * The quality table and the workload manifest, parsed from the brief's documents together: each
+ * document is found by its schema, then its rows are read into the table and the manifest. A
+ * document without its array member yields null for that half — a brief may carry one without
+ * the other — exactly as the two separate parsers did before they were folded into this one.
+ * The rows are read the same way: a ratings row through ratingOf, a manifest row through
+ * workloadRequestOf, skipping the rows neither recognises.
+ */
+function parseBriefTables(docs: Json[]): { ratings: RatingsFile | null; workload: WorkloadFile | null } {
+  const ratingsDoc = findDoc(docs, RATINGS_SCHEMA, 'ratings');
+  const workloadDoc = findDoc(docs, WORKLOAD_SCHEMA, 'manifest');
+  let ratings: RatingsFile | null = null;
+  if (ratingsDoc !== null && Array.isArray(ratingsDoc.ratings)) {
+    const rows = ratingsDoc.ratings.flatMap((v) => {
+      const r = ratingOf(v);
+      return r === null ? [] : [r];
+    });
+    const best = Array.isArray(ratingsDoc.best)
+      ? ratingsDoc.best.flatMap((v) => {
+          if (!isRecord(v) || stringOf(v.id) === '') return [];
+          return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
+        })
+      : [];
+    ratings = { schema: RATINGS_SCHEMA, ratings: rows, best };
+  }
+  let workload: WorkloadFile | null = null;
+  if (workloadDoc !== null && Array.isArray(workloadDoc.manifest)) {
+    const manifest = workloadDoc.manifest.flatMap((v) => {
+      const w = workloadRequestOf(v);
+      return w === null ? [] : [w];
+    });
+    workload = { schema: WORKLOAD_SCHEMA, manifest };
+  }
+  return { ratings, workload };
 }
 
 /** The document with one schema, when the brief holds one with the required array member. */
@@ -325,8 +335,7 @@ export function readBrief(path: string): Brief {
     const p = providerOf(v);
     return p === null ? [] : [p];
   });
-  const ratings = parseRatings(findDoc(docs, RATINGS_SCHEMA, 'ratings'));
-  const workload = parseWorkload(findDoc(docs, WORKLOAD_SCHEMA, 'manifest'));
+  const { ratings, workload } = parseBriefTables(docs);
   return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
 }
 

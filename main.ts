@@ -241,14 +241,12 @@ function isRoutable(probe: Probe, model: ProbedModel, requires: Requirement, jso
 }
 
 /**
- * The free models that can serve one request, plan first. The planned (provider, model) for this
- * request index goes first, then the same provider's other models, then every other provider's
- * models in rating order — that tail is the failover order, used only when the planned pick
- * refuses. Rating dominates the tail: quality is 60% of the score and a refusal costs only a
- * failover, so a provider that failed once stays where its rating puts it. A provider with three
- * consecutive failures is still tried if nothing else is left, but it never outranks the plan.
+ * Every model that can serve one request, unsorted: the free, capable, unrefused models across
+ * the providers that answered, each with its rating from the quality table (0 where the table
+ * has no row). The JSON-mode rule lives here: an anthropic-wire provider cannot carry JSON mode,
+ * so its models never appear for such a request.
  */
-function rankedCandidates(clientApi: 'openai' | 'anthropic', body: Json, requires: Requirement, reqIndex: number): Candidate[] {
+function collectRoutable(clientApi: 'openai' | 'anthropic', body: Json, requires: Requirement): Candidate[] {
   const jsonMode = clientApi === 'openai' && openAIJsonMode(body);
   const out: Candidate[] = [];
   for (const probe of probes) {
@@ -259,9 +257,33 @@ function rankedCandidates(clientApi: 'openai' | 'anthropic', body: Json, require
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
+  return out;
+}
+
+/**
+ * The free models that can serve one request, plan first. The planned (provider, model) for this
+ * request index goes first, then the same provider's other models, then every other provider's
+ * models in rating order — that tail is the failover order, used only when the planned pick
+ * refuses. Rating dominates the tail: quality is 60% of the score and a refusal costs only a
+ * failover, so a provider that failed once stays where its rating puts it. A provider with three
+ * consecutive failures is still tried if nothing else is left, but it never outranks the plan.
+ */
+function rankedCandidates(clientApi: 'openai' | 'anthropic', body: Json, requires: Requirement, reqIndex: number): Candidate[] {
+  const out = collectRoutable(clientApi, body, requires);
   const plan = plannedPair(reqIndex);
   out.sort((a, b) => compareByPlan(a, b, plan));
   return out;
+}
+
+/**
+ * The candidates for one request, plan first: the manifest's requirements for this arrival
+ * index, the routable models collected, sorted with the planned pick first and the failover tail
+ * in rating order. The arrival index is read here and consumed by requirementsNow, once per
+ * request, exactly as serveRequest did before this helper existed.
+ */
+function rankCandidatesFor(clientApi: 'openai' | 'anthropic', body: Json): Candidate[] {
+  const reqIndex = arrivalIndex;
+  return rankedCandidates(clientApi, body, requirementsNow(body), reqIndex);
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -553,8 +575,7 @@ function sendDelivery(res: ServerResponse, clientApi: 'openai' | 'anthropic', st
 async function serveRequest(clientApi: 'openai' | 'anthropic', req: IncomingMessage, res: ServerResponse): Promise<void> {
   const parsed = await parseChatRequest(req);
   if (!parsed.ok) return replyError(res, clientApi, 400, 'invalid_request_error', parsed.error);
-  const reqIndex = arrivalIndex;
-  const candidates = rankedCandidates(clientApi, parsed.body, requirementsNow(parsed.body), reqIndex);
+  const candidates = rankCandidatesFor(clientApi, parsed.body);
   const delivery = await deliverRequest(clientApi, parsed.body, candidates, parsed.stream);
   sendDelivery(res, clientApi, parsed.stream, delivery);
 }
