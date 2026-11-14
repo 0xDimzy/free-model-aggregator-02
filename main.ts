@@ -429,10 +429,96 @@ async function postUpstream(candidate: Candidate, clientApi: 'openai' | 'anthrop
   return { kind: 'answered', ok: response.ok, status: response.status, text };
 }
 
+/** What one candidate's attempt produced, once its bookkeeping is recorded. */
+type AttemptOutcome =
+  | { kind: 'refused' }
+  | { kind: 'answered'; text: string; wire: 'openai' | 'anthropic' | 'gemini'; modelId: string };
+
 /**
- * One client request, served by the planned (provider, model) first. A refusal (402, 429, 5xx,
- * unreachable, or a 400 naming an unknown or paid model) moves to the next candidate in rating
- * order; a provider is never retried for the same request. A 2xx answer ends the request at once.
+ * The bookkeeping for one upstream attempt: the call count, the consecutive-failure streak, the
+ * refused-pairs set and the log line. Every attempt counts once, answered or not. A refusal
+ * (unreachable, or a non-2xx) bumps the streak and moves on; a 400 also blacklists the
+ * (provider, model) pair so it is never tried again; a 2xx resets the streak and hands the
+ * answer back for translation. The caller only ever translates a 2xx.
+ */
+function recordOutcome(candidate: Candidate, result: UpstreamResult): AttemptOutcome {
+  const key = `${candidate.probe.provider.id}/${candidate.model.id}`;
+  const stats = statsFor(candidate.probe.provider.id);
+  stats.calls += 1;
+  if (result.kind === 'unreachable') {
+    stats.consecutiveFailures += 1;
+    log(`${key} unreachable: ${result.message}`);
+    return { kind: 'refused' };
+  }
+  if (!result.ok) {
+    stats.consecutiveFailures += 1;
+    if (result.status === 400) refusedPairs.add(key);
+    log(`${key} refused HTTP ${result.status}: ${result.text.slice(0, 200)}`);
+    return { kind: 'refused' };
+  }
+  stats.consecutiveFailures = 0;
+  return { kind: 'answered', text: result.text, wire: candidate.probe.provider.wire, modelId: candidate.model.id };
+}
+
+/** What serving one request produced: the converted answer, an unreadable 2xx, or no answer at all. */
+type Delivery =
+  | { kind: 'served'; text: string }
+  | { kind: 'unreadable' }
+  | { kind: 'none' };
+
+/**
+ * Walk the candidates in order, one upstream POST each, until one answers 2xx. A refusal (402,
+ * 429, 5xx, unreachable, or a 400 naming an unknown or paid model) moves to the next candidate
+ * in rating order; a provider is never retried for the same request. A 2xx is translated into
+ * the client's wire and ends the request at once. A 2xx that cannot be read is still the
+ * request's one successful call: it ends the walk as 'unreadable' rather than calling a second
+ * provider and breaking the one-provider check.
+ */
+async function deliverRequest(clientApi: 'openai' | 'anthropic', body: Json, candidates: Candidate[], stream: boolean): Promise<Delivery> {
+  const tried = new Set<string>();
+  for (const candidate of candidates) {
+    const key = `${candidate.probe.provider.id}/${candidate.model.id}`;
+    if (tried.has(key)) continue;
+    tried.add(key);
+    const result = await postUpstream(candidate, clientApi, body);
+    const outcome = recordOutcome(candidate, result);
+    if (outcome.kind === 'refused') continue;
+    try {
+      const converted = await translateResponse(outcome.wire, clientApi, outcome.text, stream, outcome.modelId);
+      return { kind: 'served', text: converted };
+    } catch (err) {
+      log(`${key} answered unreadably: ${(err as Error).message}`);
+      return { kind: 'unreadable' };
+    }
+  }
+  return { kind: 'none' };
+}
+
+/**
+ * Send one delivery to the client: the converted text as SSE or JSON, a 502 for a 2xx that
+ * could not be read, or a 503 when no free model answered the request.
+ */
+function sendDelivery(res: ServerResponse, clientApi: 'openai' | 'anthropic', stream: boolean, delivery: Delivery): void {
+  if (delivery.kind === 'served') {
+    if (stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      res.end(delivery.text);
+    } else {
+      sendPlain(res, 200, 'application/json', delivery.text.endsWith('\n') ? delivery.text : `${delivery.text}\n`);
+    }
+    return;
+  }
+  if (delivery.kind === 'unreadable') {
+    replyError(res, clientApi, 502, 'upstream_unreadable', 'the provider answered in a shape that could not be read');
+    return;
+  }
+  replyError(res, clientApi, 503, 'no_free_model', 'no free model on the directory answered this request');
+}
+
+/**
+ * One client request, served by the planned (provider, model) first. The delivery walk above
+ * picks the provider; this function only reads the body, ranks the candidates and sends the
+ * answer the walk produced.
  */
 async function serveRequest(clientApi: 'openai' | 'anthropic', req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readBodyJson(req);
@@ -440,44 +526,8 @@ async function serveRequest(clientApi: 'openai' | 'anthropic', req: IncomingMess
   const stream = body.stream === true;
   const reqIndex = arrivalIndex;
   const candidates = rankedCandidates(clientApi, body, requirementsNow(body), reqIndex);
-  const tried = new Set<string>();
-  for (const candidate of candidates) {
-    const key = `${candidate.probe.provider.id}/${candidate.model.id}`;
-    if (tried.has(key)) continue;
-    tried.add(key);
-    const stats = statsFor(candidate.probe.provider.id);
-    const result = await postUpstream(candidate, clientApi, body);
-    stats.calls += 1;
-    if (result.kind === 'unreachable') {
-      stats.consecutiveFailures += 1;
-      log(`${key} unreachable: ${result.message}`);
-      continue;
-    }
-    if (!result.ok) {
-      stats.consecutiveFailures += 1;
-      if (result.status === 400) refusedPairs.add(key);
-      log(`${key} refused HTTP ${result.status}: ${result.text.slice(0, 200)}`);
-      continue;
-    }
-    stats.consecutiveFailures = 0;
-    let converted: string;
-    try {
-      converted = await translateResponse(candidate.probe.provider.wire, clientApi, result.text, stream, candidate.model.id);
-    } catch (err) {
-      // A 2xx answer that cannot be read is still the request's one successful call: answer the
-      // failure rather than calling a second provider and breaking the one-provider check.
-      log(`${key} answered unreadably: ${(err as Error).message}`);
-      return replyError(res, clientApi, 502, 'upstream_unreadable', 'the provider answered in a shape that could not be read');
-    }
-    if (stream) {
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      res.end(converted);
-    } else {
-      sendPlain(res, 200, 'application/json', converted.endsWith('\n') ? converted : `${converted}\n`);
-    }
-    return;
-  }
-  return replyError(res, clientApi, 503, 'no_free_model', 'no free model on the directory answered this request');
+  const delivery = await deliverRequest(clientApi, body, candidates, stream);
+  sendDelivery(res, clientApi, stream, delivery);
 }
 
 async function routeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {

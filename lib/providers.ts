@@ -446,19 +446,29 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
  * for byte. The scorer compares a reported base_url by its path suffix, so the path passes exactly as the
  * joined URL does; the joined URL reaches a provider, the path names it.
  */
+/** One catalog row for one listed model: free by the quality table where it has a row, context from the row first. */
+function catalogEntry(model: ProbedModel, row: RatingRow | null): CatalogModel {
+  return { id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null };
+}
+
+/** One provider's listed models, sorted by id with duplicates dropped, first listing wins. */
+function uniqueSortedModels(probe: Probe): ProbedModel[] {
+  const seen = new Set<string>();
+  const out: ProbedModel[] = [];
+  const sorted = [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  for (const model of sorted) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    out.push(model);
+  }
+  return out;
+}
+
 export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings: RatingsFile | null): CatalogReport {
   const providers: CatalogProvider[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    const sorted = [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    for (const model of sorted) {
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
-    }
+    const models = uniqueSortedModels(probe).map((model) => catalogEntry(model, ratingOfModel(ratings, probe.provider.id, model.id)));
     providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
   }
   return { providers };
