@@ -130,41 +130,39 @@ function statsOf(providerId: string): { calls: number; consecutiveFailures: numb
 }
 
 /**
- * The fixed routing plan: [request index, provider id, model id], one row per request, in manifest
- * arrival order. Minimum-quality-loss assignment under the safe leading-call counts (groq 5,
- * cerebras 2, gemini 3, zai 1, openrouter 1, sambanova 2, pollinations 4, cloudflare 1, ovh 2,
- * kilol 6): total loss 567 milli, quality 98 at the 20-call floor. A request whose planned pick
- * refuses fails over to the next candidate by rating; the plan itself never retries a provider.
+ * The fixed routing plan, keyed by request index: [provider id, model id], one row per request,
+ * in manifest arrival order. Minimum-quality-loss assignment under the safe leading-call counts
+ * (groq 5, cerebras 2, gemini 3, zai 1, openrouter 1, sambanova 2, pollinations 4, cloudflare 1,
+ * ovh 2, kilol 6): total loss 567 milli, quality 98 at the 20-call floor. A request whose planned
+ * pick refuses fails over to the next candidate by rating; the plan itself never retries a provider.
+ * Stored as a Map so the lookup is a single get, not a scan of the table on every request.
  */
-const PLAN: ReadonlyArray<readonly [number, string, string]> = [
-  [0, 'gemini', 'gemini-3.8-flash'],
-  [1, 'gemini', 'gemini-3.8-flash'],
-  [2, 'openrouter', 'z-ai/glm-5.3-flash:free'],
-  [3, 'zai', 'glm-4.7-flash'],
-  [4, 'sambanova', 'deepseek-v3.2'],
-  [5, 'gemini', 'gemini-3.8-flash'],
-  [6, 'sambanova', 'deepseek-v3.2'],
-  [7, 'cerebras', 'qwen-3.8-27b'],
-  [8, 'cerebras', 'qwen-3.8-27b'],
-  [9, 'ovh', 'qwen3.5-397b'],
-  [10, 'ovh', 'qwen3.5-397b'],
-  [11, 'cloudflare', 'glm-4.7-flash'],
-  [12, 'groq', 'qwen3.8-27b'],
-  [13, 'groq', 'qwen3.8-27b'],
-  [14, 'groq', 'qwen3.8-27b'],
-  [15, 'groq', 'qwen3.8-27b'],
-  [16, 'groq', 'qwen3.8-27b'],
-  [17, 'kilol', 'kilo-auto/free'],
-  [18, 'kilol', 'kilo-auto/free'],
-  [19, 'kilol', 'kilo-auto/free'],
-];
+const PLAN = new Map<number, readonly [string, string]>([
+  [0, ['gemini', 'gemini-3.8-flash']],
+  [1, ['gemini', 'gemini-3.8-flash']],
+  [2, ['openrouter', 'z-ai/glm-5.3-flash:free']],
+  [3, ['zai', 'glm-4.7-flash']],
+  [4, ['sambanova', 'deepseek-v3.2']],
+  [5, ['gemini', 'gemini-3.8-flash']],
+  [6, ['sambanova', 'deepseek-v3.2']],
+  [7, ['cerebras', 'qwen-3.8-27b']],
+  [8, ['cerebras', 'qwen-3.8-27b']],
+  [9, ['ovh', 'qwen3.5-397b']],
+  [10, ['ovh', 'qwen3.5-397b']],
+  [11, ['cloudflare', 'glm-4.7-flash']],
+  [12, ['groq', 'qwen3.8-27b']],
+  [13, ['groq', 'qwen3.8-27b']],
+  [14, ['groq', 'qwen3.8-27b']],
+  [15, ['groq', 'qwen3.8-27b']],
+  [16, ['groq', 'qwen3.8-27b']],
+  [17, ['kilol', 'kilo-auto/free']],
+  [18, ['kilol', 'kilo-auto/free']],
+  [19, ['kilol', 'kilo-auto/free']],
+]);
 
 /** The planned (provider, model) for one request index, or undefined when the plan has no row. */
 function planFor(reqIndex: number): readonly [string, string] | undefined {
-  for (const [index, providerId, modelId] of PLAN) {
-    if (index === reqIndex) return [providerId, modelId];
-  }
-  return undefined;
+  return PLAN.get(reqIndex);
 }
 
 /** Probe every provider and build the one catalog (the `--list` document and the register body). */
@@ -201,6 +199,28 @@ interface Candidate {
 }
 
 /**
+ * Where one candidate sits in the order for a request: 0 is the planned (provider, model),
+ * 1 is the same provider's other models, 2 is every other provider's models. The sort below
+ * puts rank first, then rating, then provider and model id — so the plan leads, the tail is the
+ * failover order in rating order, and the order is total (deterministic) even when ratings tie.
+ */
+function candidateRank(candidate: Candidate, plan: readonly [string, string] | undefined): number {
+  if (plan === undefined) return 2;
+  if (candidate.probe.provider.id === plan[0] && candidate.model.id === plan[1]) return 0;
+  if (candidate.probe.provider.id === plan[0]) return 1;
+  return 2;
+}
+
+function compareCandidates(a: Candidate, b: Candidate, plan: readonly [string, string] | undefined): number {
+  const rankA = candidateRank(a, plan);
+  const rankB = candidateRank(b, plan);
+  if (rankA !== rankB) return rankA - rankB;
+  if (a.rating !== b.rating) return b.rating - a.rating;
+  if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
+  return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
+}
+
+/**
  * The free models that can serve one request, plan first. The planned (provider, model) for this
  * request index goes first, then the same provider's other models, then every other provider's
  * models in rating order — that tail is the failover order, used only when the planned pick
@@ -226,20 +246,7 @@ function candidatesFor(clientApi: 'openai' | 'anthropic', body: Json, requires: 
     }
   }
   const plan = planFor(reqIndex);
-  const rankOf = (candidate: Candidate): number => {
-    if (plan === undefined) return 2;
-    if (candidate.probe.provider.id === plan[0] && candidate.model.id === plan[1]) return 0;
-    if (candidate.probe.provider.id === plan[0]) return 1;
-    return 2;
-  };
-  out.sort((a, b) => {
-    const rankA = rankOf(a);
-    const rankB = rankOf(b);
-    if (rankA !== rankB) return rankA - rankB;
-    if (a.rating !== b.rating) return b.rating - a.rating;
-    if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
-    return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
-  });
+  out.sort((a, b) => compareCandidates(a, b, plan));
   return out;
 }
 
@@ -374,6 +381,33 @@ async function convertResponse(providerWire: 'openai' | 'anthropic' | 'gemini', 
   return clientApi === 'openai' ? geminiStreamToOpenAI(upstreamText, modelId) : geminiStreamToAnthropic(upstreamText, modelId);
 }
 
+type UpstreamResult =
+  | { kind: 'unreachable'; message: string }
+  | { kind: 'answered'; ok: boolean; status: number; text: string };
+
+/**
+ * One upstream POST, in the candidate's own wire, with its body read. A refused connection (or a
+ * fetch that aborts) comes back as 'unreachable' with the error's message, so the caller can log
+ * it exactly as it would have inline; a completed POST comes back with its status and text.
+ * The caller owns the call counting: every attempt, answered or not, counts once.
+ */
+async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<UpstreamResult> {
+  const upstream = upstreamRequest(candidate, clientApi, body);
+  let response: Response;
+  try {
+    response = await fetch(upstream.url, {
+      method: 'POST',
+      headers: upstream.headers,
+      body: upstream.body,
+      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return { kind: 'unreachable', message: (err as Error).message };
+  }
+  const text = await response.text();
+  return { kind: 'answered', ok: response.ok, status: response.status, text };
+}
+
 /**
  * One client request, served by the planned (provider, model) first. A refusal (402, 429, 5xx,
  * unreachable, or a 400 naming an unknown or paid model) moves to the next candidate in rating
@@ -391,33 +425,23 @@ async function serve(clientApi: 'openai' | 'anthropic', req: IncomingMessage, re
     if (tried.has(key)) continue;
     tried.add(key);
     const stats = statsOf(candidate.probe.provider.id);
-    const upstream = upstreamRequest(candidate, clientApi, body);
-    let response: Response;
-    try {
-      response = await fetch(upstream.url, {
-        method: 'POST',
-        headers: upstream.headers,
-        body: upstream.body,
-        signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
-      });
-    } catch (err) {
-      stats.calls += 1;
+    const result = await callUpstream(candidate, clientApi, body);
+    stats.calls += 1;
+    if (result.kind === 'unreachable') {
       stats.consecutiveFailures += 1;
-      log(`${key} unreachable: ${(err as Error).message}`);
+      log(`${key} unreachable: ${result.message}`);
       continue;
     }
-    const text = await response.text();
-    stats.calls += 1;
-    if (!response.ok) {
+    if (!result.ok) {
       stats.consecutiveFailures += 1;
-      if (response.status === 400) badModels.add(key);
-      log(`${key} refused HTTP ${response.status}: ${text.slice(0, 200)}`);
+      if (result.status === 400) badModels.add(key);
+      log(`${key} refused HTTP ${result.status}: ${result.text.slice(0, 200)}`);
       continue;
     }
     stats.consecutiveFailures = 0;
     let converted: string;
     try {
-      converted = await convertResponse(candidate.probe.provider.wire, clientApi, text, stream, candidate.model.id);
+      converted = await convertResponse(candidate.probe.provider.wire, clientApi, result.text, stream, candidate.model.id);
     } catch (err) {
       // A 2xx answer that cannot be read is still the request's one successful call: answer the
       // failure rather than calling a second provider and breaking the one-provider check.

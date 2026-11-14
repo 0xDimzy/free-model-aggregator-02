@@ -168,39 +168,46 @@ export function authHeaders(auth: AuthScheme, key: string): Record<string, strin
   return {};
 }
 
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
-  }
-  return out;
-}
-
 /** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
 function objectEnd(text: string, start: number): number {
   let depth = 0;
   let inString = false;
-  for (let i = start; i < text.length; i++) {
+  let i = start;
+  while (i < text.length) {
     const ch = text[i];
     if (inString) {
       if (ch === '\\') i += 1;
       else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
       depth -= 1;
       if (depth === 0) return i;
     }
+    i += 1;
   }
   return -1;
+}
+
+/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
+function documentsIn(text: string): Json[] {
+  const out: Json[] = [];
+  let start = text.indexOf('{');
+  while (start !== -1) {
+    const end = objectEnd(text, start);
+    if (end !== -1) {
+      try {
+        const value: unknown = JSON.parse(text.slice(start, end + 1));
+        if (isRecord(value) && typeof value.schema === 'string') out.push(value);
+      } catch {
+        // Not JSON on its own: look on.
+      }
+    }
+    start = text.indexOf('{', start + 1);
+  }
+  return out;
 }
 
 function stringOf(v: unknown): string {
@@ -250,6 +257,7 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
   const id = stringOf(v.id);
   if (id === '') return null;
   const requires = isRecord(v.requires) ? v.requires : {};
+  const minContext = typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {};
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
@@ -259,9 +267,35 @@ function workloadRequestOf(v: unknown): WorkloadRequest | null {
       tools: requires.tools === true,
       vision: requires.vision === true,
       json: requires.json === true,
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
+      ...minContext,
     },
   };
+}
+
+/** The quality table parsed from its document, or null when the document has no ratings array. */
+function ratingsFrom(doc: Json | null): RatingsFile | null {
+  if (doc === null || !Array.isArray(doc.ratings)) return null;
+  const ratings = doc.ratings.flatMap((v) => {
+    const r = ratingOf(v);
+    return r === null ? [] : [r];
+  });
+  const best = Array.isArray(doc.best)
+    ? doc.best.flatMap((v) => {
+        if (!isRecord(v) || stringOf(v.id) === '') return [];
+        return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
+      })
+    : [];
+  return { schema: RATINGS_SCHEMA, ratings, best };
+}
+
+/** The workload manifest parsed from its document, or null when it has no manifest array. */
+function workloadFrom(doc: Json | null): WorkloadFile | null {
+  if (doc === null || !Array.isArray(doc.manifest)) return null;
+  const manifest = doc.manifest.flatMap((v) => {
+    const w = workloadRequestOf(v);
+    return w === null ? [] : [w];
+  });
+  return { schema: WORKLOAD_SCHEMA, manifest };
 }
 
 /** The brief at `path`, its three documents found by schema. */
@@ -284,34 +318,9 @@ export function readBrief(path: string): Brief {
     return p === null ? [] : [p];
   });
   const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
-  const ratingRows = ratingsDoc !== null && Array.isArray(ratingsDoc.ratings) ? ratingsDoc.ratings : null;
-  const ratings: RatingsFile | null =
-    ratingsDoc === null || ratingRows === null
-      ? null
-      : {
-          schema: RATINGS_SCHEMA,
-          ratings: ratingRows.flatMap((v) => {
-            const r = ratingOf(v);
-            return r === null ? [] : [r];
-          }),
-          best: Array.isArray(ratingsDoc.best)
-            ? ratingsDoc.best.flatMap((v) => {
-                if (!isRecord(v) || stringOf(v.id) === '') return [];
-                return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
-              })
-            : [],
-        };
+  const ratings = ratingsFrom(ratingsDoc);
   const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload: WorkloadFile | null =
-    workloadDoc === null || !Array.isArray(workloadDoc.manifest)
-      ? null
-      : {
-          schema: WORKLOAD_SCHEMA,
-          manifest: workloadDoc.manifest.flatMap((v) => {
-            const w = workloadRequestOf(v);
-            return w === null ? [] : [w];
-          }),
-        };
+  const workload = workloadFrom(workloadDoc);
   return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
 }
 
@@ -367,10 +376,11 @@ function modelIn(wire: Wire, v: unknown): ProbedModel | null {
   if (!isRecord(v)) return null;
   const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
   if (id === '') return null;
+  const displayName = stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id;
   const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
   return {
     id,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id,
+    display_name: displayName,
     free: boolOrNull(v.free) ?? zeroPriced(v),
     context_length: context,
     tools: boolOrNull(v.tools),
