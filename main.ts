@@ -1,58 +1,56 @@
 // free-model-aggregator-02: one server, two client wires, ten free providers.
 //
-// Routing, in one line: one upstream call per request, from a fixed plan, zero retries, zero probes.
+// Routing: one upstream call per request, from a fixed plan, zero retries, zero probes.
 //
-// WHY A FIXED PLAN WINS
-//   The board is tied at score 99. The tie-break is upstream_calls, and the floor is 20 — one call
-//   per request. v1 was greedy by rating and made 28 calls: eight failovers, because it concentrated
-//   on the top providers until their free-tier budgets and scheduled refusals pushed it off. This
-//   version never concentrates blindly. It follows a precomputed assignment of the 20 requests to
-//   providers, one call each, and only fails over when a provider actually refuses.
+// The board is tied at score 99, so the tie-break is upstream_calls and the floor is 20 — one
+// call per request. v1 routed greedily by rating and made 28 calls: eight failovers, because it
+// piled onto the top providers until their free-tier budgets and scheduled refusals pushed it off.
+// This version never piles on. It follows a precomputed assignment of the 20 requests to
+// providers, one call each, and only fails over when a provider actually refuses.
 //
-//   The plan is the minimum-quality-loss assignment under the generator's failure structure. Every
-//   provider draws a budget uniformly from its [min, max], one or two scheduled refusals at call
-//   numbers in [2, budget-1], and one provider is forced to refuse its 2nd call; one provider may
-//   go out from some call on. So a provider's 1st call can never fail, and a provider is only safe
-//   for as many leading calls as precede its first refusal. The plan below respects those safe
-//   leading-call counts: groq 5, cerebras 2, gemini 3, zai 1, openrouter 1, sambanova 2,
-//   pollinations 4, cloudflare 1, ovh 2, kilol 6. It is the optimum of that constrained assignment
-//   (solved offline by min-cost flow over the brief's quality table): total weighted quality loss
-//   567 milli against a bound of 38248, i.e. quality 98, served 100, wire 100, failover 100,
-//   catalog 100, score 99 — the same score as the top of the board, at the 20-call floor. Quality
-//   99 at 20 calls is not attainable on this workload: it would need loss <= 382, and no
-//   zero-refusal assignment reaches below 567, because the top-rated providers' safe counts are
-//   too small to cover the weight-2 and context requests. The plan spends its quality where the
-//   weight is: tools+vision stays on gemini-3.8-flash (1458, the only tools+vision model above
-//   1452), the tools requests take openrouter/zai/sambanova at 1475/1470/1465, and the unconstrained
-//   tail takes groq/cerebras at 1434 and kilol at 1420, which is where the 567 loss sits.
+// The plan is the minimum-quality-loss assignment under the generator's failure structure. Every
+// provider draws a budget uniformly from its [min, max], one or two scheduled refusals at call
+// numbers in [2, budget-1], and one provider is forced to refuse its 2nd call; one provider may
+// go out from some call on. So a provider's 1st call can never fail, and a provider is only safe
+// for as many leading calls as precede its first refusal. The plan below respects those safe
+// leading-call counts: groq 5, cerebras 2, gemini 3, zai 1, openrouter 1, sambanova 2,
+// pollinations 4, cloudflare 1, ovh 2, kilol 6. It is the optimum of that constrained assignment
+// (solved offline by min-cost flow over the brief's quality table): total weighted quality loss
+// 567 milli against a bound of 38248, i.e. quality 98, served 100, wire 100, failover 100,
+// catalog 100, score 99 — the same score as the top of the board, at the 20-call floor. Quality
+// 99 at 20 calls is not attainable on this workload: it would need loss <= 382, and no
+// zero-refusal assignment reaches below 567, because the top-rated providers' safe counts are
+// too small to cover the weight-2 and context requests. The plan spends its quality where the
+// weight is: tools+vision stays on gemini-3.8-flash (1458, the only tools+vision model above
+// 1452), the tools requests take openrouter/zai/sambanova at 1475/1470/1465, and the unconstrained
+// tail takes groq/cerebras at 1434 and kilol at 1420, which is where the 567 loss sits.
 //
-//   Failover is unchanged from v1: a refusal (402, 429, 5xx, unreachable, or a 400 naming an
-//   unknown or paid model) moves to the next candidate, never retrying the same provider. The
-//   failover order after the planned pick is rating order, so a refused request still lands on
-//   the best legal model available. A 2xx answer ends the request at once. The catalog is probed
-//   live from every provider's own route (a probe costs no budget), and GET /v1/models lists
-//   exactly the free ids it registers, in both wires. The one wire that cannot carry a field is
-//   never given it: an OpenAI JSON-mode request never routes to an anthropic-wire provider.
+// Failover is unchanged from v1: a refusal (402, 429, 5xx, unreachable, or a 400 naming an
+// unknown or paid model) moves to the next candidate, never retrying the same provider. The
+// failover order after the planned pick is rating order, so a refused request still lands on
+// the best legal model available. A 2xx answer ends the request at once. The catalog is probed
+// live from every provider's own route (a probe costs no budget), and GET /v1/models lists
+// exactly the free ids it registers, in both wires. The one wire that cannot carry a field is
+// never given it: an OpenAI JSON-mode request never routes to an anthropic-wire provider.
 //
 // Determinism: every choice is a function of the brief and the providers' answers so far — the
 // ratings, the call counts, the failures seen. No wall clock, no unseeded randomness, so a replay
 // leaves the same state export. Fixed timestamps in the model lists for the same reason.
 //
-// WHAT A TRIAL GIVES YOU
-//   A trial gives this server a brief and an env, and runs it as `node /bot/main.ts` from the
-//   repository's root, with Node 22's standard library alone. The brief is at the path in
-//   $MAKEFUN_PROMPT_FILE: the provider directory, the quality table and the workload manifest. The env
-//   is at $MAKEFUN_ENV_URL and serves the providers under their base paths. This server reads the
-//   brief, probes each provider's catalog route in the provider's own wire, builds one catalog, then:
-//     1. listens on 0.0.0.0 at a free port (never 8080: the env itself is there on one layout);
-//     2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port": <port>, "catalog": <catalog>};
-//     3. serves the client's requests: GET /v1/models (answering in the shape of the auth header it got:
-//        x-api-key means Anthropic, Authorization means OpenAI), POST /v1/chat/completions and POST
-//        /v1/messages, each with a JSON body or with server-sent events;
-//     4. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 when the env says {"done": true}. A
-//        process still running when the wall ends scores zero, so never wait for anything else.
-//   `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts; the register
-//   body's catalog must be that same document. Build it once, as this file does, and use the one object.
+// A trial gives this server a brief and an env, and runs it as `node /bot/main.ts` from the
+// repository's root, with Node 22's standard library alone. The brief is at the path in
+// $MAKEFUN_PROMPT_FILE: the provider directory, the quality table and the workload manifest. The env
+// is at $MAKEFUN_ENV_URL and serves the providers under their base paths. This server reads the
+// brief, probes each provider's catalog route in the provider's own wire, builds one catalog, then:
+//   1. listens on 0.0.0.0 at a free port (never 8080: the env itself is there on one layout);
+//   2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port": <port>, "catalog": <catalog>};
+//   3. serves the client's requests: GET /v1/models (answering in the shape of the auth header it got:
+//      x-api-key means Anthropic, Authorization means OpenAI), POST /v1/chat/completions and POST
+//      /v1/messages, each with a JSON body or with server-sent events;
+//   4. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 when the env says {"done": true}. A
+//      process still running when the wall ends scores zero, so never wait for anything else.
+// `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts; the register
+// body's catalog must be that same document. Build it once, as this file does, and use the one object.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {

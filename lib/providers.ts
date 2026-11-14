@@ -1,31 +1,32 @@
 // The brief's three documents and the catalog probe.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) carries three JSON documents, and the prose around
-// them does not matter: this file finds each by its `schema` member.
+// A trial's brief (the path in MAKEFUN_PROMPT_FILE) carries three JSON documents, and the prose
+// around them does not matter: this file finds each by its `schema` member.
 //
-//   - the provider directory (`free-model-aggregator-01/providers/v1`): one row a provider, with its id,
-//     its wire, its auth scheme, the environment variable a real deployment would read the key from, the
-//     key the simulated service takes, and the base path the entry joins to MAKEFUN_ENV_URL. A directory
-//     entry may give an absolute base_url instead of a path; joinBase takes either.
+//   - the provider directory (`free-model-aggregator-01/providers/v1`): one row a provider, with
+//     its id, its wire, its auth scheme, the environment variable a real deployment would read the
+//     key from, the key the simulated service takes, and the base path the entry joins to
+//     MAKEFUN_ENV_URL. A directory entry may give an absolute base_url instead of a path; joinBase
+//     takes either.
 //   - the quality table (`free-model-aggregator-01/ratings/v1`): each model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and whether it is free. The
-//     scorer ranks an answer by its rating; a paid model is never a legal pick. This baseline reads the
-//     table's capability columns and free flag (the sealed truth, where a row exists) but never its
-//     rating (`--list` shows why in main.ts's header, and the routing TODO there names the gap).
-//   - the workload manifest (`free-model-aggregator-01/workload/v1`): the requests the client will send,
-//     in order, each with its api, whether it streams, its weight and the requirements a model must meet
-//     to serve it.
+//     milli-points, what it can do (tools, vision, JSON mode, context length) and whether it is
+//     free. The scorer ranks an answer by its rating; a paid model is never a legal pick. This
+//     baseline reads the table's capability columns and free flag (the sealed truth, where a row
+//     exists) but never its rating.
+//   - the workload manifest (`free-model-aggregator-01/workload/v1`): the requests the client will
+//     send, in order, each with its api, whether it streams, its weight and the requirements a
+//     model must meet to serve it.
 //
 // It then probes each provider's catalog route in the provider's own wire:
 //
 //   openai     GET <base>/v1/models          Authorization: Bearer <key>
-//   anthropic  GET <base>/v1/models          x-api-key: <key>, anthropic-version: 2023-06-01
-//   gemini     GET <base>/v1beta/models      x-goog-api-key: <key>
+//   anthropic  GET <base>/v1/models          x-api-key: <redacted>
+//   gemini     GET <base>/v1beta/models      x-goog-api-key: <redacted>
 //
-// A probe that fails (a refused connection, a non-2xx, a body that is not JSON) leaves its provider out of
-// the catalog and gets no traffic; the trial goes on. Everything here is deterministic: no clock, no
-// randomness, so `node main.ts --list` and the register body build the same document (main.ts prints or
-// posts this one object).
+// A probe that fails (a refused connection, a non-2xx, a body that is not JSON) leaves its provider
+// out of the catalog and gets no traffic; the trial goes on. Everything here is deterministic: no
+// clock, no randomness, so `node main.ts --list` and the register body build the same document
+// (main.ts prints or posts this one object).
 
 import { readFileSync } from 'node:fs';
 

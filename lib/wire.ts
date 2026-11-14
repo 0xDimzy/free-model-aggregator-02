@@ -139,10 +139,11 @@ function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-/** An OpenAI request's output cap: max_tokens, else max_completion_tokens. */
+/** An OpenAI request's output cap: max_tokens, else max_completion_tokens. A non-finite cap is
+ * ignored rather than passed on: it would serialize as null and fail the provider's echo check. */
 function openAIMaxTokens(body: Json): number | undefined {
-  if (typeof body.max_tokens === 'number') return body.max_tokens;
-  if (typeof body.max_completion_tokens === 'number') return body.max_completion_tokens;
+  if (typeof body.max_tokens === 'number' && Number.isFinite(body.max_tokens)) return body.max_tokens;
+  if (typeof body.max_completion_tokens === 'number' && Number.isFinite(body.max_completion_tokens)) return body.max_completion_tokens;
   return undefined;
 }
 
